@@ -3,7 +3,11 @@ from __future__ import annotations
 import json
 import os
 import random
+import sys
+import threading
+import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -11,6 +15,7 @@ from typing import Any, Callable
 import torch
 import torch.distributed as dist
 from transformers import DynamicCache
+from tqdm import tqdm
 
 from deepspec.data.parser import encode_chat_messages
 from deepspec.utils.sampling import (
@@ -26,6 +31,171 @@ from deepspec.utils import (
 
 
 DEFAULT_DATASET_ROOT = "./eval_datasets"
+
+
+def _now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(path)
+
+
+class DatasetProgress:
+    """Show one rank-0 tqdm bar aggregated through lightweight progress files."""
+
+    def __init__(
+        self,
+        *,
+        dataset_name: str,
+        total_samples: int,
+        local_samples: int,
+        global_rank: int,
+        world_size: int,
+        progress_dir: str | None,
+    ):
+        self.dataset_name = dataset_name
+        self.total_samples = int(total_samples)
+        self.local_samples = int(local_samples)
+        self.global_rank = int(global_rank)
+        self.world_size = int(world_size)
+        self.progress_root = Path(progress_dir) if progress_dir is not None else None
+        self.dataset_dir = (
+            self.progress_root / dataset_name
+            if self.progress_root is not None
+            else None
+        )
+        self.rank_path = (
+            self.dataset_dir / f"rank_{self.global_rank}.json"
+            if self.dataset_dir is not None
+            else None
+        )
+        self.completed = 0
+        self.progress_bar = None
+        self.stop_event = threading.Event()
+        self.monitor_thread = None
+
+    def _write_rank_state(self, status: str) -> None:
+        if self.rank_path is None:
+            return
+        _write_json_atomic(
+            self.rank_path,
+            {
+                "dataset": self.dataset_name,
+                "rank": self.global_rank,
+                "world_size": self.world_size,
+                "completed_samples": self.completed,
+                "assigned_samples": self.local_samples,
+                "status": status,
+                "updated_at": _now_iso(),
+            },
+        )
+
+    def _read_aggregate(self) -> tuple[int, int]:
+        assert self.dataset_dir is not None
+        completed = 0
+        ready_ranks = 0
+        for rank in range(self.world_size):
+            path = self.dataset_dir / f"rank_{rank}.json"
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                continue
+            completed += int(payload.get("completed_samples", 0))
+            ready_ranks += 1
+        return min(completed, self.total_samples), ready_ranks
+
+    def _refresh_aggregate(self, *, force: bool = False) -> None:
+        assert self.progress_bar is not None
+        assert self.dataset_dir is not None
+        completed, ready_ranks = self._read_aggregate()
+        delta = completed - int(self.progress_bar.n)
+        if delta > 0:
+            self.progress_bar.update(delta)
+        if delta > 0 or force:
+            self.progress_bar.set_postfix_str(
+                f"ranks={ready_ranks}/{self.world_size}",
+                refresh=True,
+            )
+            _write_json_atomic(
+                self.dataset_dir / "progress.json",
+                {
+                    "dataset": self.dataset_name,
+                    "completed_samples": completed,
+                    "total_samples": self.total_samples,
+                    "ready_ranks": ready_ranks,
+                    "world_size": self.world_size,
+                    "status": (
+                        "completed" if completed >= self.total_samples else "running"
+                    ),
+                    "updated_at": _now_iso(),
+                },
+            )
+
+    def _monitor(self) -> None:
+        while not self.stop_event.wait(1.0):
+            self._refresh_aggregate()
+
+    def __enter__(self):
+        if self.dataset_dir is not None:
+            self.dataset_dir.mkdir(parents=True, exist_ok=True)
+            self._write_rank_state("running")
+        if self.global_rank == 0:
+            aggregate_enabled = self.dataset_dir is not None
+            bar_total = self.total_samples if aggregate_enabled else self.local_samples
+            description = (
+                f"{self.dataset_name} samples"
+                if aggregate_enabled
+                else f"{self.dataset_name} rank0 samples"
+            )
+            self.progress_bar = tqdm(
+                total=bar_total,
+                desc=description,
+                unit="sample",
+                dynamic_ncols=True,
+                mininterval=1.0,
+                file=sys.stderr,
+                leave=True,
+            )
+            if aggregate_enabled:
+                self._refresh_aggregate(force=True)
+                self.monitor_thread = threading.Thread(
+                    target=self._monitor,
+                    name=f"{self.dataset_name}-progress-monitor",
+                    daemon=True,
+                )
+                self.monitor_thread.start()
+        return self
+
+    def advance(self) -> None:
+        self.completed += 1
+        self._write_rank_state("running")
+        if (
+            self.global_rank == 0
+            and self.progress_root is None
+            and self.progress_bar is not None
+        ):
+            self.progress_bar.update(1)
+
+    def __exit__(self, exc_type, exc_value, traceback_obj):
+        success = exc_type is None
+        self._write_rank_state("completed" if success else "failed")
+
+        if self.global_rank == 0 and self.progress_bar is not None:
+            if self.monitor_thread is not None:
+                if success:
+                    while self._read_aggregate()[0] < self.total_samples:
+                        time.sleep(1.0)
+                self.stop_event.set()
+                self.monitor_thread.join(timeout=5.0)
+                self._refresh_aggregate(force=True)
+            self.progress_bar.close()
+        return False
 
 
 def load_and_process_dataset(
@@ -445,7 +615,11 @@ class BaseEvaluator:
 
     def __init__(self, local_rank: int, args):
         self.args = args
-        self.device, self.global_rank, self.world_size = init_dist(local_rank)
+        self.device, self.global_rank, self.world_size = init_dist(
+            local_rank,
+            timeout_minutes=int(getattr(args, "dist_timeout_minutes", 24 * 60)),
+            backend=str(getattr(args, "dist_backend", "gloo")),
+        )
         self.tasks = args.tasks
 
         self.target_model, self.draft_model, self.tokenizer = self.build_models()
@@ -527,25 +701,120 @@ class BaseEvaluator:
 
         stop_token_ids = resolve_stop_token_ids(self.target_model, self.tokenizer)
         responses = []
-        for idx in range(self.global_rank, len(dataset), self.world_size):
-            seed_all(int(self.args.seed) + idx)
-            instance = dataset[idx]
-            messages = [{"role": "user", "content": instance["turns"][0]}]
-            input_ids = encode_chat_messages(
-                self.tokenizer,
-                messages,
-                add_generation_prompt=True,
-                enable_thinking=False,
-                # enable_thinking=True,
-            ).to(self.device)
-            responses.append(
-                self.generate_one_sample(
-                    input_ids=input_ids,
-                    stop_token_ids=stop_token_ids,
-                )
+        local_indices = range(self.global_rank, len(dataset), self.world_size)
+        if self.global_rank == 0:
+            print(
+                f"Dataset {dataset_name}: {len(dataset)} samples across "
+                f"{self.world_size} rank(s)",
+                flush=True,
             )
+        with DatasetProgress(
+            dataset_name=dataset_name,
+            total_samples=len(dataset),
+            local_samples=len(local_indices),
+            global_rank=self.global_rank,
+            world_size=self.world_size,
+            progress_dir=getattr(self.args, "progress_dir", None),
+        ) as progress:
+            for idx in local_indices:
+                seed_all(int(self.args.seed) + idx)
+                instance = dataset[idx]
+                messages = [{"role": "user", "content": instance["turns"][0]}]
+                input_ids = encode_chat_messages(
+                    self.tokenizer,
+                    messages,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                    # enable_thinking=True,
+                ).to(self.device)
+                responses.append(
+                    self.generate_one_sample(
+                        input_ids=input_ids,
+                        stop_token_ids=stop_token_ids,
+                    )
+                )
+                progress.advance()
 
         return responses
+
+    def _update_manifest_dataset(self, dataset_name: str, **updates) -> None:
+        if dist.get_rank() != 0:
+            return
+        manifest_value = getattr(self.args, "experiment_manifest_path", None)
+        if manifest_value is None:
+            return
+        manifest_path = Path(manifest_value)
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            return
+
+        for dataset_record in manifest.get("datasets", []):
+            if dataset_record.get("name") == dataset_name:
+                dataset_record.update(updates)
+                break
+        manifest["last_update_time"] = _now_iso()
+        manifest["completed_dataset_count"] = sum(
+            record.get("status") == "completed"
+            for record in manifest.get("datasets", [])
+        )
+        _write_json_atomic(manifest_path, manifest)
+
+    def mark_dataset_started(self, dataset_name: str) -> None:
+        if dist.get_rank() != 0:
+            return
+        started_at = _now_iso()
+        self._update_manifest_dataset(
+            dataset_name,
+            status="running",
+            phase="sampling",
+            started_at=started_at,
+            completed_at=None,
+        )
+        print(f"Starting dataset: {dataset_name}", flush=True)
+
+    def mark_dataset_phase(self, dataset_name: str, phase: str) -> None:
+        if dist.get_rank() != 0:
+            return
+        self._update_manifest_dataset(
+            dataset_name,
+            status="running",
+            phase=phase,
+        )
+        print(f"Dataset {dataset_name}: {phase}", flush=True)
+
+    def record_incremental_dataset_result(
+        self,
+        *,
+        metrics_row: dict[str, object],
+        confidence_summary: dict | None = None,
+    ) -> None:
+        if dist.get_rank() != 0:
+            return
+        completed_at = _now_iso()
+        result = {
+            "dataset": metrics_row["dataset"],
+            "completed_at": completed_at,
+            "spec": metrics_row,
+            "confidence_summary": confidence_summary,
+        }
+        results_value = getattr(self.args, "dataset_results_path", None)
+        if results_value is not None:
+            results_path = Path(results_value)
+            results_path.parent.mkdir(parents=True, exist_ok=True)
+            with results_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            print(f"Appended dataset result to {results_path}", flush=True)
+
+        self._update_manifest_dataset(
+            str(metrics_row["dataset"]),
+            status="completed",
+            phase="completed",
+            completed_at=completed_at,
+            result=result,
+        )
 
     def allreduce_response_metrics(
         self,
@@ -597,6 +866,11 @@ class BaseEvaluator:
                     if accepted_draft_length > pos_idx:
                         accepted_at_pos[pos_idx] += 1
 
+        reduction_device = (
+            torch.device("cpu")
+            if str(dist.get_backend()).lower() == "gloo"
+            else self.device
+        )
         scalar_tensor = torch.tensor(
             [
                 int(metric_summary["sample_count"]),
@@ -604,14 +878,14 @@ class BaseEvaluator:
                 int(metric_summary["acceptance_length_sum"]),
                 int(metric_summary["proposal_length_sum"]),
             ],
-            device=self.device,
+            device=reduction_device,
             dtype=torch.int64,
         )
         dist.all_reduce(scalar_tensor, op=dist.ReduceOp.SUM)
 
         position_tensor = torch.tensor(
             proposals_at_pos + accepted_at_pos,
-            device=self.device,
+            device=reduction_device,
             dtype=torch.int64,
         )
         if position_tensor.numel() > 0:
@@ -712,15 +986,20 @@ class BaseEvaluator:
 
     def evaluate(self) -> None:
         for dataset_name, max_samples in self.tasks:
+            self.mark_dataset_started(dataset_name)
             responses = self.run_dataset(
                 dataset_name=dataset_name,
                 max_samples=max_samples,
             )
+            self.mark_dataset_phase(dataset_name, "reducing_spec_metrics")
             metric_summary = self.allreduce_response_metrics(responses)
-            self.record_dataset_metrics(
+            metrics_row = self.record_dataset_metrics(
                 dataset_name=dataset_name,
                 metric_summary=metric_summary,
             )
+            if metrics_row is not None:
+                self.mark_dataset_phase(dataset_name, "writing_incremental_result")
+                self.record_incremental_dataset_result(metrics_row=metrics_row)
 
         self.report_results()
 

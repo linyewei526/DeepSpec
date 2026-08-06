@@ -8,7 +8,11 @@ import torch.distributed as dist
 from torch.utils.data import Sampler
 
 
-def init_dist(local_rank: int, timeout_minutes: int = 60):
+def init_dist(
+    local_rank: int,
+    timeout_minutes: int = 60,
+    backend: str = "nccl",
+):
     local_world_size = torch.cuda.device_count()
     node_rank = int(os.environ.get("RANK", "0"))
     node_world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -20,14 +24,16 @@ def init_dist(local_rank: int, timeout_minutes: int = 60):
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
 
-    dist.init_process_group(
-        backend="nccl",
+    init_kwargs = dict(
+        backend=backend,
         init_method=init_method,
         rank=rank,
         world_size=world_size,
         timeout=timedelta(minutes=timeout_minutes),
-        device_id=device,
     )
+    if backend == "nccl":
+        init_kwargs["device_id"] = device
+    dist.init_process_group(**init_kwargs)
     return device, rank, world_size
 
 

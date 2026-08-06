@@ -42,6 +42,8 @@ def parse_args():
     parser.add_argument("--tensorboard-dir", type=str, default=None)
     parser.add_argument("--step", type=int, default=None,help=("step for tensorboard logging"),)
     parser.add_argument("--seed", type=int, default=980406)
+    parser.add_argument("--dist-timeout-minutes", type=int, default=24 * 60)
+    parser.add_argument("--dist-backend", choices=("gloo", "nccl"), default="gloo")
     args = parser.parse_args()
     args.tasks = list(TASKS)
     return args

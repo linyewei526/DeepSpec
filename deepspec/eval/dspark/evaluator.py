@@ -13,7 +13,10 @@ from deepspec.eval.base_evaluator import (
     assert_no_final_target_layer,
     generate_decoding_sample,
 )
-from deepspec.eval.dspark.confidence_head import ConfidenceHeadRecorder
+from deepspec.eval.dspark.confidence_head import (
+    ConfidenceHeadRecorder,
+    summarize_confidence_row,
+)
 from deepspec.eval.dspark.draft_ops import (
     DSparkDraftProposal,
     build_dspark_proposal,
@@ -180,13 +183,17 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
 
     def evaluate(self) -> None:
         for dataset_name, max_samples in self.tasks:
+            self.mark_dataset_started(dataset_name)
             if self.confidence_head_recorder is not None:
                 self.confidence_head_recorder.start()
             responses = self.run_dataset(
                 dataset_name=dataset_name,
                 max_samples=max_samples,
             )
+            self.mark_dataset_phase(dataset_name, "reducing_spec_metrics")
             metric_summary = self.allreduce_response_metrics(responses)
+            if self.confidence_head_recorder is not None:
+                self.mark_dataset_phase(dataset_name, "reducing_confidence_metrics")
             confidence_row = (
                 self.confidence_head_recorder.finish(
                     dataset_name=dataset_name,
@@ -201,11 +208,22 @@ class Qwen3DSparkEvaluator(BaseEvaluator):
                 metric_summary=metric_summary,
             )
             if metrics_row is not None and confidence_row is not None:
+                self.mark_dataset_phase(dataset_name, "writing_artifacts")
                 self.confidence_head_recorder.report_dataset(
                     metrics_row=metrics_row,
                     confidence_row=confidence_row,
                     args_payload=jsonable(vars(self.args)),
                     tasks=self.tasks,
+                )
+            if metrics_row is not None:
+                self.mark_dataset_phase(dataset_name, "writing_incremental_result")
+                self.record_incremental_dataset_result(
+                    metrics_row=metrics_row,
+                    confidence_summary=(
+                        summarize_confidence_row(confidence_row)
+                        if confidence_row is not None
+                        else None
+                    ),
                 )
 
         self.report_results()

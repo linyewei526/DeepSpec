@@ -92,14 +92,20 @@ class PerPositionConfidenceMetrics:
         self.brier_num[:pos_count].add_(weights * (probs - targets).pow(2))
 
     def all_reduce(self) -> None:
-        for tensor in (
-            self.coarse_count,
-            self.coarse_pred,
-            self.coarse_target,
-            self.fine_pos,
-            self.fine_neg,
-            self.brier_num,
-        ):
+        tensor_names = (
+            "coarse_count",
+            "coarse_pred",
+            "coarse_target",
+            "fine_pos",
+            "fine_neg",
+            "brier_num",
+        )
+        use_cpu = str(dist.get_backend()).lower() == "gloo"
+        for tensor_name in tensor_names:
+            tensor = getattr(self, tensor_name)
+            if use_cpu:
+                tensor = tensor.detach().cpu()
+                setattr(self, tensor_name, tensor)
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
 
     @staticmethod
