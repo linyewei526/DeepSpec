@@ -1,4 +1,4 @@
-时间戳：2026-08-06 17:03:51 CST (UTC+08:00)
+时间戳（Git 状态复核）：2026-08-06 17:21:10 CST (UTC+08:00)
 
 # 给新 Codex 会话的 DeepSpec / DSpark 对齐指南
 
@@ -11,18 +11,20 @@
 ## 第 1 步：确认仓库和保护现有变更
 
 1. 工作目录应为 `/data/home/wly/dLLM/DeepSpec`。
-2. 首先执行只读检查：`git -C /data/home/wly/dLLM/DeepSpec status --short`。
-3. 检查仓库内是否新增 `AGENTS.md`；当前快照中 DeepSpec 仓库没有项目级 `AGENTS.md`。
-4. 将工作树视为用户正在使用的未提交状态。不得执行 reset/checkout/clean，不得删除 untracked 文件，不得假设某个变更可以丢弃。
+2. 首先执行只读检查：`git -C /data/home/wly/dLLM/DeepSpec status --short`、`git -C /data/home/wly/dLLM/DeepSpec rev-parse HEAD` 和 `git -C /data/home/wly/dLLM/DeepSpec rev-parse origin/main`。
+3. 本会话已完成工作的基线提交是 `de552a1063140130d162fe102945642282e93d3a` (`de552a1`, subject: `update`)。Git 复核时 `HEAD=origin/main=de552a1` 且 ahead/behind 均为 0，说明之前的代码、文档、论文归档和 `runtime/` 工具均已提交，并与当前本地 `origin/main` 跟踪引用一致。这一只读对齐步骤不需要为了重新确认远端服务器而自动 fetch/pull。
+4. 如果新会话的 `HEAD` 已经晚于 `de552a1`，先检查 `git -C /data/home/wly/dLLM/DeepSpec log --oneline de552a1..HEAD` 和对应 diff，再判断本文哪些状态描述已被后续提交更新；不得为了回到文档快照而回退新提交。
+5. 检查仓库内是否新增 `AGENTS.md`；当前快照中 DeepSpec 仓库没有项目级 `AGENTS.md`。
+6. 即使基线已提交，仍要将实时工作树差异视为用户正在使用的内容。不得执行 reset/checkout/clean，不得删除 untracked 文件，不得假设任何提交后差异可以丢弃。
 
-截至本文时间戳，与本工作相关的未提交内容包括：
+截至本文 Git 复核时间：
 
-- 已修改 `deepspec/eval/base_evaluator.py`、`deepspec/eval/dspark/evaluator.py`、`deepspec/eval/dspark/confidence_head.py`、`deepspec/utils/distributed.py` 和 `eval.py`；
-- 新增但尚未跟踪 `notes/basis/`、`notes/memory/` 和 `runtime/`；
-- `notes/DSpark_prompt.md` 有修改；它主要是需求/会话记录，不是最终技术文档；
-- 工作树还显示根目录一份已跟踪 DSpark PDF 被删除，而论文已出现在 `notes/basis/`；在用户明确要求前不要自行恢复或提交该删除。
+- commit `de552a1` 包含了之前完成的全部项目修改；`notes/basis/`、`notes/memory/` 和 `runtime/` 均已跟踪；
+- 根目录原 DSpark PDF 已以 100% rename 的形式提交到 `notes/basis/DSpark_Confidence-Scheduled Speculative Decoding.pdf`，不再存在待处理的 PDF 删除；
+- 复核开始时唯一的提交后差异是 `notes/DSpark_prompt.md` 记录了用户的当前请求；它是需求/会话日志，不是技术事实的优先来源；
+- 本次应用用户请求后，`notes/memory/quicknote.md` 和 `notes/memory/codexnote.md` 也会成为 `de552a1` 之后的文档差异，直到用户下次提交。
 
-上述只是时间戳快照，新会话必须以实时 `git status` 为准。
+上述只是时间戳快照，新会话必须以实时 Git 状态为准。
 
 ## 第 2 步：快速获取项目地图
 
@@ -66,7 +68,7 @@
 
 ## 第 5 步：理解本会话的评测代码修改
 
-先用 `git diff` 逐文件阅读实时变更，再使用以下索引：
+这些修改已经位于 commit `de552a1`，因此不能再依赖空的 working-tree `git diff` 寻找它们。先用 `git -C /data/home/wly/dLLM/DeepSpec show --stat de552a1` 确认提交范围，必要时使用 `git -C /data/home/wly/dLLM/DeepSpec show de552a1 -- <path>` 逐文件阅读该提交引入的修改，再使用以下索引：
 
 - `deepspec/eval/base_evaluator.py`：增加基于 rank JSON 文件汇聚的 tqdm，数据集 phase/manifest 更新，每完成一项就追加 `dataset_results.jsonl`，以及 Gloo 时 CPU tensor 归约。
 - `deepspec/eval/dspark/evaluator.py`：将 DSpark 每个数据集的 spec、confidence、artifact 和逐项结果写入纳入阶段跟踪。
@@ -74,7 +76,7 @@
 - `deepspec/utils/distributed.py` 和 `eval.py`：增加 distributed backend 和 timeout 参数，评测默认使用 Gloo，用来避免完成采样后 NCCL 归约卡住。
 - `runtime/run_experiment.py`：在运行开始就创建时间戳目录和 manifest，并记录数据、模型、参数、环境、进度和结果。
 
-这些修改已通过一次完整九数据集实验验证，但仍尚未提交，后续改动时必须保留这些功能或明确说明为什么替换。
+这些修改已通过一次完整九数据集实验验证，并已提交到 `de552a1`。后续改动时必须保留这些功能，或明确说明为什么替换。
 
 ## 第 6 步：继续开发时的约束
 
@@ -103,6 +105,5 @@
 - 当前 target/draft、数据和结果路径；
 - DFlash/DSpark 的推理调用链与公开代码/论文系统边界；
 - 成功九项基线及其指标性质；
-- 当前未提交变更和不可破坏的工作树状态；
+- 当前基线 commit、实时 Git 差异和不可破坏的用户工作树状态；
 - 接下来应根据用户的新任务继续，而不是从零重做已完成的调研。
-
