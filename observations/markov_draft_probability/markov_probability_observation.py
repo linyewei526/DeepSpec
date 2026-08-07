@@ -29,12 +29,12 @@ from deepspec.eval.dspark.evaluator import Qwen3DSparkEvaluator
 from deepspec.utils import CustomJSONEncoder
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BIN_WIDTH = 0.05
 PROBABILITY_MIN_BIN = 0
 PROBABILITY_MAX_BIN = 19
-SIGNED_GAP_MIN_BIN = -20
-SIGNED_GAP_MAX_BIN = 19
+GAP_MIN_BIN = 0
+GAP_MAX_BIN = 19
 RANK_CATEGORIES = tuple([str(index) for index in range(1, 11)] + ["other"])
 
 
@@ -230,7 +230,9 @@ class DatasetObservation:
         "accepted_eos_rounds",
         "correction_events",
         "first_position_correction_events",
+        "gap_candidate_events",
         "paired_gap_events",
+        "negative_gap_excluded_events",
         "undefined_relative_gap_events",
     )
 
@@ -315,17 +317,25 @@ class DatasetObservation:
         if accepted_count == 0:
             self.counts["first_position_correction_events"] += 1
         else:
+            self.counts["gap_candidate_events"] += 1
             accepted_mean = sum(accepted_values) / len(accepted_values)
             signed_gap = accepted_mean - rejected_value
-            self.signed_gap.add(signed_gap, fixed_min=-1.0, fixed_max=1.0)
-            self.counts["paired_gap_events"] += 1
-            if accepted_mean > 0.0:
-                self.signed_relative_gap.add(
-                    signed_gap / accepted_mean,
-                    fixed_max=1.0,
-                )
-            else:  # A selected softmax probability should be positive; retain an audit count.
-                self.counts["undefined_relative_gap_events"] += 1
+            if signed_gap < 0.0:
+                # The experiment intentionally conditions every gap statistic on
+                # accepted_mean >= rejected_probability.  Keep an explicit audit
+                # count, but do not add this event to either gap distribution.
+                self.counts["negative_gap_excluded_events"] += 1
+            else:
+                self.signed_gap.add(signed_gap, fixed_min=0.0, fixed_max=1.0)
+                self.counts["paired_gap_events"] += 1
+                if accepted_mean > 0.0:
+                    self.signed_relative_gap.add(
+                        signed_gap / accepted_mean,
+                        fixed_min=0.0,
+                        fixed_max=1.0,
+                    )
+                else:  # A selected softmax probability should be positive; retain an audit count.
+                    self.counts["undefined_relative_gap_events"] += 1
 
         draft_probs = proposal.draft_probs
         if draft_probs is None or draft_probs.ndim != 3 or draft_probs.size(0) != 1:
@@ -394,6 +404,30 @@ class DatasetObservation:
 
     def build_report(self, *, dataset_name: str, sample_count: int) -> dict:
         correction_events = int(self.counts["correction_events"])
+        first_position_events = int(self.counts["first_position_correction_events"])
+        gap_candidate_events = int(self.counts["gap_candidate_events"])
+        paired_gap_events = int(self.counts["paired_gap_events"])
+        negative_gap_excluded_events = int(self.counts["negative_gap_excluded_events"])
+        undefined_relative_gap_events = int(self.counts["undefined_relative_gap_events"])
+        if correction_events != first_position_events + gap_candidate_events:
+            raise RuntimeError(
+                "Gap count invariant failed: correction_events must equal "
+                "first_position_correction_events + gap_candidate_events"
+            )
+        if gap_candidate_events != paired_gap_events + negative_gap_excluded_events:
+            raise RuntimeError(
+                "Gap count invariant failed: gap_candidate_events must equal "
+                "paired_gap_events + negative_gap_excluded_events"
+            )
+        if self.signed_gap.count != paired_gap_events:
+            raise RuntimeError(
+                "Gap count invariant failed: signed_absolute_gap count must equal paired_gap_events"
+            )
+        if self.signed_relative_gap.count + undefined_relative_gap_events != paired_gap_events:
+            raise RuntimeError(
+                "Gap count invariant failed: signed_relative_gap count plus "
+                "undefined_relative_gap_events must equal paired_gap_events"
+            )
         probability_accepted = self.accepted_probability.report(
             min_bin=PROBABILITY_MIN_BIN,
             max_bin=PROBABILITY_MAX_BIN,
@@ -403,10 +437,13 @@ class DatasetObservation:
             max_bin=PROBABILITY_MAX_BIN,
         )
         signed_gap = self.signed_gap.report(
-            min_bin=SIGNED_GAP_MIN_BIN,
-            max_bin=SIGNED_GAP_MAX_BIN,
+            min_bin=GAP_MIN_BIN,
+            max_bin=GAP_MAX_BIN,
         )
-        signed_relative_gap = self.signed_relative_gap.report(include_zero=True)
+        signed_relative_gap = self.signed_relative_gap.report(
+            min_bin=GAP_MIN_BIN,
+            max_bin=GAP_MAX_BIN,
+        )
         if signed_relative_gap["mean"] is not None:
             signed_relative_gap["mean_percent"] = 100.0 * signed_relative_gap["mean"]
         else:
@@ -445,15 +482,28 @@ class DatasetObservation:
                 ),
                 "signed_absolute_gap": (
                     "mean(selected-token draft probabilities at accepted positions "
-                    "in the round) - selected-token draft probability at the rejected position"
+                    "in the round) - selected-token draft probability at the rejected position; "
+                    "reported only when this value is nonnegative"
                 ),
                 "signed_relative_gap": (
                     "signed_absolute_gap / mean(selected-token draft probabilities "
-                    "at accepted positions in the round)"
+                    "at accepted positions in the round); reported only for the same "
+                    "nonnegative-gap events"
                 ),
-                "negative_gap": (
-                    "the rejected position's selected-token draft probability was "
-                    "higher than the same-round accepted-position mean"
+                "gap_candidate_event": (
+                    "a correction event with at least one accepted draft position, "
+                    "so the same-round accepted-position mean is defined"
+                ),
+                "negative_gap_exclusion": (
+                    "when signed_absolute_gap < 0, increment negative_gap_excluded_events "
+                    "and exclude the event from paired_gap_events, both gap distributions, "
+                    "gap means, CDF/CSV/plots, and probability-derived TensorBoard gap "
+                    "summaries; the exclusion audit count itself remains visible"
+                ),
+                "paired_gap_event": (
+                    "a gap candidate with signed_absolute_gap >= 0 that enters the "
+                    "signed_absolute_gap distribution; it also enters signed_relative_gap "
+                    "unless the accepted-position mean is zero"
                 ),
                 "true_draft_rank": (
                     "1 + count_v(q_k[v] > q_k[correction_token]) over the complete "
@@ -496,7 +546,10 @@ def summarize_observation_report(report: dict) -> dict:
         "correction_events": report["counts"]["correction_events"],
         "rejected_probability_mean": distributions["rejected_selected_draft_probability"]["mean"],
         "first_position_correction_events": report["counts"]["first_position_correction_events"],
+        "gap_candidate_events": report["counts"]["gap_candidate_events"],
         "paired_gap_events": report["counts"]["paired_gap_events"],
+        "negative_gap_excluded_events": report["counts"]["negative_gap_excluded_events"],
+        "undefined_relative_gap_events": report["counts"]["undefined_relative_gap_events"],
         "signed_absolute_gap_mean": distributions["signed_absolute_gap"]["mean"],
         "signed_relative_gap_mean": distributions["signed_relative_gap"]["mean"],
         "signed_relative_gap_mean_percent": distributions["signed_relative_gap"]["mean_percent"],
@@ -572,8 +625,12 @@ def _plot_report(dataset_dir: Path, report: dict) -> Path:
         bins = distributions[key]["bins"]
         if bins:
             axes[1].plot([row["upper"] for row in bins], [row["cdf"] or 0.0 for row in bins], label=label)
-    axes[1].axvline(0.0, color="0.5", linestyle="--", linewidth=1)
-    axes[1].set(xlabel="signed gap (accepted mean - rejected)", ylabel="CDF", ylim=(0, 1.01))
+    axes[1].set(
+        xlabel="gap (accepted mean - rejected), conditioned on gap >= 0",
+        ylabel="CDF",
+        xlim=(0, 1),
+        ylim=(0, 1.01),
+    )
     axes[1].grid(alpha=0.25)
     axes[1].legend()
 
@@ -686,6 +743,10 @@ class MarkovDraftProbabilityRecorder:
         scalar_keys = (
             "accepted_probability_mean",
             "rejected_probability_mean",
+            "gap_candidate_events",
+            "paired_gap_events",
+            "negative_gap_excluded_events",
+            "undefined_relative_gap_events",
             "signed_absolute_gap_mean",
             "signed_relative_gap_mean",
             "signed_relative_gap_mean_percent",
@@ -717,7 +778,9 @@ class MarkovDraftProbabilityRecorder:
             "accepted_mean",
             "corrections",
             "rejected_mean",
-            "paired_n",
+            "gap_candidates",
+            "negative_excluded",
+            "included_gap_n",
             "signed_gap_mean",
             "signed_gap_%",
             *[f"rank{index}" for index in range(1, 11)],
@@ -733,6 +796,8 @@ class MarkovDraftProbabilityRecorder:
                     fmt(row["accepted_probability_mean"]),
                     row["correction_events"],
                     fmt(row["rejected_probability_mean"]),
+                    row["gap_candidate_events"],
+                    row["negative_gap_excluded_events"],
                     row["paired_gap_events"],
                     fmt(row["signed_absolute_gap_mean"]),
                     fmt(row["signed_relative_gap_mean_percent"]),

@@ -293,7 +293,7 @@ def main() -> None:
     observation_artifact_root = run_dir / "observations" / "markov_draft_probability"
 
     settings = {
-        "schema_version": 1,
+        "schema_version": 2,
         "experiment": "dspark_qwen3_8b_markov_draft_probability_and_true_draft_rank",
         "created_at": now_iso(),
         "run_dir": str(run_dir),
@@ -315,17 +315,24 @@ def main() -> None:
             ),
             "signed_gap": (
                 "mean(P_k for accepted draft positions in the round) - P_rejected; "
-                "sign is retained."
+                "only events with signed_gap >= 0 enter gap counts and distributions."
             ),
             "signed_relative_gap": (
                 "signed_gap / mean(P_k for accepted draft positions in the round); "
-                "reported as ratio and percent."
+                "computed only for the same signed_gap >= 0 events and reported as ratio and percent."
+            ),
+            "negative_gap_exclusion": (
+                "A correction event with an accepted prefix is a gap candidate. If signed_gap < 0, "
+                "negative_gap_excluded_events is incremented and the event is excluded from "
+                "paired_gap_events and all probability-derived gap means, CDF/CSV, plots, and "
+                "TensorBoard gap summaries; the exclusion audit count itself is still reported."
             ),
             "true_draft_rank": (
                 "1 + count(q_k[v] > q_k[correction_token]) over the complete "
                 "Markov-corrected q_k; categories 1..10,other."
             ),
             "cdf_bin_width": 0.05,
+            "gap_cdf_range": [0.0, 1.0],
         },
         "scope": {
             "dataset_selection": cli.dataset,

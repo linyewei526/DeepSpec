@@ -29,7 +29,14 @@ P_k=q_k(z_k).
    - `signed_relative_gap = signed_absolute_gap / accepted_mean`；
    - `signed_relative_gap_mean_percent = 100 * mean(signed_relative_gap)`。
 
-   所有差值保留符号，不做绝对值化或零截断。负值表示失败位置错误 draft token 的 $P_k$ 反而高于本轮通过位置均值。绝对差固定在 `[-1,1]` 上按 0.05 分箱；相对差不裁剪，按 0.05 在实际观测范围动态分箱。若第一个位置就失败，本轮计入 `first_position_correction_events`，但不进入 gap 分布。若 `accepted_mean` 数值为零，会计入 `undefined_relative_gap_events`，仅绝对差有效。
+   有 accepted prefix 的 correction event 先计入 `gap_candidate_events`。若 `signed_absolute_gap < 0`，只增加 `negative_gap_excluded_events`；除这个明确保留并展示的排除审计计数外，该事件不增加 `paired_gap_events`，也不进入 absolute/relative gap 的样本计数、均值、PMF/CDF、CSV、图或 TensorBoard 概率统计。接受位置和拒绝位置各自的 $P_k$ 分布以及 `true_draft_rank` 仍照常记录。若 `signed_absolute_gap >= 0`（包含恰好为零），才计入 `paired_gap_events` 和 gap 分布。因此以下关系必须成立：
+
+   ```text
+   correction_events = first_position_correction_events + gap_candidate_events
+   gap_candidate_events = paired_gap_events + negative_gap_excluded_events
+   ```
+
+   过滤后的 absolute gap 和 relative gap 都位于 `[0,1]`，固定按 0.05 分为 `[0.00,0.05)` 至 `[0.95,1.00]`。若第一个位置就失败，本轮计入 `first_position_correction_events`，但不是 gap candidate。若一个已纳入事件的 `accepted_mean` 数值为零，会计入 `undefined_relative_gap_events`：absolute gap 仍有效，relative gap 不记录。这里报告的是以 `signed_absolute_gap >= 0` 为条件的 gap 分布，不再表示全部 correction events 的无条件分布。
 4. `true_draft_rank`：在失败位置完整的、Markov 头修正后的 draft logits softmax 分布 $q_k$ 上，计算实际 correction token 的真实 competition rank：
 
 \[
@@ -162,12 +169,14 @@ YYYYMMDD_HHMMSS_markov_draft_probability_all/
 - `dataset_results.jsonl`：每完成一个数据集 `flush+fsync` 追加一行，包含 baseline speculative metrics、原有累计 confidence 摘要和本实验摘要。
 - `metrics.json`：该数据集的完整定义、计数、均值、0.05 分箱、PMF、CDF 和 rank 分布，是权威聚合结果。
 - `markov_draft_probability_cdf.csv`：通过位置提交 token 与失败位置错误 draft token 的 $q_k(z_k)$ 分布。
-- `signed_gap_cdf.csv`：带符号绝对差和带符号相对差分布。
+- `signed_gap_cdf.csv`：过滤掉 `signed_absolute_gap < 0` 事件后，非负 absolute gap 和 relative gap 在 `[0,1]` 上的分布。
 - `true_draft_rank.csv`：`1..10,other` 的 count/probability，以及各类 correction token 的 draft $q_k$ 概率统计。
 - `rank_stats/`：每个 rank 的充分统计量，便于审计跨卡合并；不是逐 token 原始日志。
 - `tensorboard/`：保留原复现的 speculative/confidence 指标，并增加 `markov_draft_probability/<dataset>/...` 标量。
 
-CDF CSV 中 `probability` 是当前 0.05 区间的概率，`cdf` 是截至该区间上沿的累计概率。对 relative gap，数值 `0.25` 表示失败位置错误 draft token 的 $P_k$ 比同轮通过位置均值低 25%，`-0.25` 表示它反而高 25%。
+CDF CSV 中 `probability` 是当前 0.05 区间占全部已纳入该 gap 分布事件的比例，`cdf` 是截至该区间上沿的累计比例。对 relative gap，数值 `0.25` 表示失败位置错误 draft token 的 $P_k$ 比同轮通过位置均值低 25%。负 relative gap 不会出现，因为对应事件已由 `signed_absolute_gap < 0` 条件排除；排除规模应查看 `metrics.json`、`dataset_results.jsonl` 或终端汇总中的 `negative_gap_excluded_events`。
+
+本修改后的观测产物使用 schema version 2。目录 `20260807_173321_markov_draft_probability_all` 是修改前 schema version 1 运行，保留带符号负 gap，不能与新语义下的 gap 均值/CDF 直接混合比较，也不会被原地改写；要获得新口径结果，必须按本指南重新建立新的时间戳目录运行。新运行的 settings 会在模型加载前写明过滤定义和 `[0,1]` 的 gap CDF 范围。
 
 ## 8. 运行监控与完整性检查
 
