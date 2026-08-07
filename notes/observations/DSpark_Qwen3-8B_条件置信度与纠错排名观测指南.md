@@ -1,0 +1,190 @@
+# DSpark Qwen3-8B 条件置信度与纠错排名观测指南
+
+## 1. 实验目的
+
+本实验在既有 Qwen3-8B DSpark 推理复现链路上增加只读观测，不修改 `deepspec/`、`eval.py` 或 `runtime/` 中的复现代码，也不改变采样、验证、接受或纠错逻辑。观测钩子在一次验证已经得到结果后运行，不调用随机数生成函数，因此在相同 checkpoint、数据、超参、rank 数和 seed 下不会改变解码结果。
+
+本实验不是任务正确率、`pass@1`、LLM judge、端到端速度或 TPS 实验。逐轮把 GPU 张量同步到 CPU 并计算完整词表排名会增加观测开销，所以本实验产物不能用来代表无观测 baseline 的耗时。
+
+## 2. 四项指标的精确定义
+
+令第 $k$ 个 draft token 的 confidence-head logit 为 $c_k$，本实验记录
+
+\[
+s_k=\operatorname{sigmoid}(c_k).
+\]
+
+这里的 $s_k$ 是“此前 prefix draft tokens 均被接受时，当前位置自己的接受置信度”，不是已有校准实验采用的累积概率 $\prod_{i\le k}s_i$。
+
+1. `accepted_conditional_confidence`：所有验证轮中，逐个记录实际通过验证的 draft 位置的 $s_k$。报告总数、均值、最小值、最大值，以及宽度为 0.05 的 PMF/CDF。置信度区间固定为 `[0.00,0.05)` 到 `[0.95,1.00]`。
+2. `rejected_conditional_confidence`：仅记录每轮第一个验证失败、随后由 `verification.next_token` 替换的位置的 $s_k$。后续未被验证的 draft 位置不纳入。空 draft proposal 也不伪装成拒绝事件。
+3. 同轮有至少一个已通过 draft token 时，令 `accepted_mean` 为本轮这些通过位置的原始 $s_k$ 均值：
+   - `signed_absolute_gap = accepted_mean - rejected_confidence`；
+   - `signed_relative_gap = signed_absolute_gap / accepted_mean`；
+   - `signed_relative_gap_mean_percent = 100 * mean(signed_relative_gap)`。
+
+   所有差值都保留符号，不做绝对值化或零截断。负值表示失败位置的 confidence 反而高于本轮通过位置均值。绝对差固定在 `[-1,1]` 上按 0.05 分箱；相对差不裁剪，按 0.05 在实际观测范围动态分箱。若本轮第一个位置就失败，则不存在“同轮通过位置均值”，该轮计入 `first_position_correction_events`，但不进入两种 gap 分布。理论上 sigmoid 后的 `accepted_mean` 大于零；若数值下溢为零，会计入 `undefined_relative_gap_events`，仅绝对差有效。
+4. `true_draft_rank`：在失败位置完整的、Markov 头修正后的 draft logits softmax 分布 $q_k$ 上，计算实际 correction token 的真实 competition rank：
+
+\[
+\operatorname{rank}=1+\#\{v:q_k(v)>q_k(\text{correction token})\}.
+\]
+
+   排名使用完整词表，不使用 top-k 近似；并列概率共享同一名次。输出类别为 `1,2,...,10,other`，每类给出 count 和占全部 correction events 的 probability，同时附该类 correction token 的 $q_k$ 概率均值、最小值和最大值。`temperature=1.0` 下 draft token 仍由分布采样，所以“实际提交 token”不应被硬编码为 rank 1；本实验始终按完整 $q_k$ 计算 correction token 的真实排名。
+
+DSpark 当前验证实现中的 correction token 是从归一化正残差分布 `[p_k-q_k]_+` 采样并实际提交的 `verification.next_token`，这里的“被替换上的 token”严格指它，而不是 target 分布的 argmax。
+
+## 3. 代码隔离与调用链
+
+本实验所有接口代码都位于独立子目录：
+
+- `observations/conditional_confidence/__init__.py`：子实验包入口；
+- `observations/conditional_confidence/confidence_observation.py`：观测累加器、跨 rank 合并、CDF/rank 产物和隔离 evaluator；
+- `observations/conditional_confidence/run_confidence_observation.py`：时间戳目录校验、不可变 settings、自动端口租约、manifest 和多 GPU 启动；
+- `observations/conditional_confidence/summarize_confidence_observation.py`：只读汇总工具。
+
+调用链为 `run_confidence_observation.py -> torch.multiprocessing.spawn -> ConditionalConfidenceEvaluator -> Qwen3DSparkEvaluator.generate_one_sample -> generate_decoding_sample -> build_dspark_proposal -> verify_draft_tokens -> _post_verify`。新 evaluator 先保留父类原有 confidence 校准记录，再执行本实验的只读观测。
+
+每个 rank 只写本轮结果目录下自己的 `rank_stats/rank_<rank>.json`；barrier 后由 rank 0 合并，因此不同实验只要使用不同时间戳目录就不会互相覆盖。启动器省略 `--master-port` 时会探测空闲本地端口，并在 `/tmp/deepspec_conditional_confidence_ports/` 建立本实验启动器可识别的运行期端口租约；已有监听端口以及并行启动的同类实验租约都会避开。若需要手工指定端口，可以显式传 `--master-port`，已占用或已租约的端口会直接报错。
+
+## 4. 环境与 baseline 对齐
+
+环境沿用复现指南：
+
+- Conda Python：`/data/home/wly/.conda/envs/dspark/bin/python`；
+- target：`/data1/linyewei/models/Qwen3-8B`；
+- draft：`/data1/linyewei/models/dspark_qwen3_8b_block7`；
+- 非 thinking chat template；
+- `max_new_tokens=2048`、`temperature=1.0`、`confidence_threshold=0.0`、`seed=980406`；
+- SDPA、每进程 batch size 1、Gloo；
+- 全量九数据集上限依次为 GSM8K 500、MATH-500 500、AIME25 30、HumanEval 164、MBPP 256、LiveCodeBench 500、MT-Bench 80、Alpaca 500、Arena-Hard-v2 500。
+
+这些设置与 `notes/basis/DSpark_Qwen3-8B_推理复现指南.md` 第 8.2 节示例一致。`CUDA_VISIBLE_DEVICES` 只决定该次进程可见的 GPU；启动器不会替用户抢占、清理或限制其他 GPU 任务。每张可见 GPU 都加载一份完整 target+draft，并按 rank 切分样本。
+
+## 5. 推荐命令
+
+以下每条命令都是单个物理行。先确认使用 dspark 环境，或直接像示例一样使用该环境的绝对 Python 路径。
+
+### 5.1 两个样本的轻量 smoke
+
+```bash
+set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_conditional_confidence_smoke_gsm8k && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE -u MASTER_PORT CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 /data/home/wly/.conda/envs/dspark/bin/python /data/home/wly/dLLM/DeepSpec/observations/conditional_confidence/run_confidence_observation.py gsm8k --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 64 --temperature 1.0 --confidence-threshold 0.0 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 --master-addr 127.0.0.1 --max-samples 2 2>&1 | tee "$RUN_DIR/eval.log"
+```
+
+### 5.2 推荐的两卡九数据集全量命令
+
+该命令按原指南第 8.2 节使用物理 GPU 2、3；可按实际显存情况修改可见卡列表。这里故意不设置固定 `MASTER_PORT`，由启动器自动分配。
+
+```bash
+set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_conditional_confidence_all && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE -u MASTER_PORT CUDA_VISIBLE_DEVICES=0,1,2,3 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 /data/home/wly/.conda/envs/dspark/bin/python /data/home/wly/dLLM/DeepSpec/observations/conditional_confidence/run_confidence_observation.py all --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 2048 --temperature 1.0 --confidence-threshold 0.0 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 --master-addr 127.0.0.1 2>&1 | tee "$RUN_DIR/eval.log"
+```
+
+### 5.3 单数据集全量命令
+
+将位置参数 `gsm8k` 换成其余八个合法名字即可。
+
+```bash
+set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_conditional_confidence_gsm8k && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE -u MASTER_PORT CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 /data/home/wly/.conda/envs/dspark/bin/python /data/home/wly/dLLM/DeepSpec/observations/conditional_confidence/run_confidence_observation.py gsm8k --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 2048 --temperature 1.0 --confidence-threshold 0.0 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 --master-addr 127.0.0.1 2>&1 | tee "$RUN_DIR/eval.log"
+```
+
+### 5.4 汇总已完成的数据集
+
+```bash
+/data/home/wly/.conda/envs/dspark/bin/python /data/home/wly/dLLM/DeepSpec/observations/conditional_confidence/summarize_confidence_observation.py /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/<时间戳目录>
+```
+
+只看一个数据集：
+
+```bash
+/data/home/wly/.conda/envs/dspark/bin/python /data/home/wly/dLLM/DeepSpec/observations/conditional_confidence/summarize_confidence_observation.py /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/<时间戳目录> --dataset gsm8k
+```
+
+在终端额外展开完整 0.05 CDF：
+
+```bash
+/data/home/wly/.conda/envs/dspark/bin/python /data/home/wly/dLLM/DeepSpec/observations/conditional_confidence/summarize_confidence_observation.py /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/<时间戳目录> --show-cdf
+```
+
+## 6. 参数逐项说明
+
+| 参数 | 默认值 | 含义 |
+|---|---:|---|
+| 位置参数 `dataset` | 无 | `all` 或九个数据集名称之一：`gsm8k`、`math500`、`aime25`、`humaneval`、`mbpp`、`livecodebench`、`mt-bench`、`alpaca`、`arena-hard-v2`。 |
+| `--run-dir` | 必填 | 必须是结果根目录的直接子目录，名字匹配 `YYYYMMDD_HHMMSS_<标签>`。目录只允许预先存在由 `tee` 建立的 `eval.log`；已有实验目录拒绝复用。 |
+| `--target` | Qwen3-8B 本地路径 | target checkpoint。启动前验证本地目录和 `config.json`，不会联网下载。 |
+| `--draft` | block7 本地路径 | DSpark draft checkpoint；必须是 `Qwen3DSparkModel`，并启用 confidence head 与 Markov 修正。 |
+| `--max-new-tokens` | `2048` | 每个样本最多生成 token 数。smoke 可临时设为 `64`。 |
+| `--temperature` | `1.0` | target/draft 采样及验证使用的温度；必须大于 0。 |
+| `--confidence-threshold` | `0.0` | draft confidence early-stop 阈值，范围 `[0,1]`。为与 baseline 和全 block 观测一致，全量实验保持 `0.0`。 |
+| `--seed` | `980406` | 数据子采样与逐样本随机采样 seed。 |
+| `--step` | `0` | TensorBoard step 和原有 confidence artifact 的 step 目录。 |
+| `--dist-backend` | `gloo` | 多进程归约后端，可选 `gloo`/`nccl`；baseline 对齐使用 `gloo`。 |
+| `--dist-timeout-minutes` | `1440` | 进程组超时分钟数。 |
+| `--master-addr` | `127.0.0.1` | 单机分布式 rendezvous 地址。 |
+| `--master-port` | 自动 | 不传时自动探测并租约；传入时严格检查端口范围、占用和同类实验租约。 |
+| `--max-samples` | 无 | 对每个所选数据集覆盖样本上限，但不会超过内置 cap；仅建议 smoke 使用。 |
+
+环境变量说明：`CUDA_VISIBLE_DEVICES` 决定进程数和逻辑卡映射；`env -u RANK -u WORLD_SIZE` 避免继承外部分布式作业的 rank；`env -u MASTER_PORT` 确保没有旧端口值干扰自动分配；`PYTHONPATH` 指向仓库；两个 offline 变量禁止 Hugging Face 联网解析。
+
+## 7. 结果目录与文件
+
+启动器接受目录后首先以独占创建方式写 `settings.json`，而且后续绝不修改它。它记录实验目标、公式、超参、数据文件 SHA-256、checkpoint config SHA-256、实时 Git commit/工作树、GPU 映射、自动端口和完整命令。随后才建立 manifest、artifact 目录和加载模型；因此模型加载失败时仍保留启动设置。
+
+典型目录如下：
+
+```text
+YYYYMMDD_HHMMSS_conditional_confidence_all/
+├── settings.json
+├── experiment_manifest.json
+├── dataset_results.jsonl
+├── eval.log
+├── progress/<dataset>/...
+├── tensorboard/
+│   └── artifacts/step_0/<dataset>/...
+└── observations/conditional_confidence/<dataset>/
+    ├── metrics.json
+    ├── conditional_confidence_cdf.csv
+    ├── signed_gap_cdf.csv
+    ├── true_draft_rank.csv
+    ├── observation_plots.png
+    └── rank_stats/rank_<rank>.json
+```
+
+- `experiment_manifest.json`：可变运行状态；每完成一个数据集立即更新，失败时保留错误堆栈。
+- `dataset_results.jsonl`：每完成一个数据集 `flush+fsync` 追加一行，包含 baseline speculative metrics、原有累计 confidence 摘要和本实验摘要。
+- `metrics.json`：该数据集的完整定义、计数、均值、0.05 分箱、PMF、CDF 和 rank 分布，是权威聚合结果。
+- `conditional_confidence_cdf.csv`：通过位置与失败替换位置的原始 conditional confidence 分布。
+- `signed_gap_cdf.csv`：带符号绝对差和带符号相对差分布。
+- `true_draft_rank.csv`：`1..10,other` 的 count/probability，以及各类 correction token 的 draft $q_k$ 概率统计。
+- `rank_stats/`：每个 rank 的充分统计量，便于审计跨卡合并；不是逐 token 原始日志。
+- `tensorboard/`：保留原复现的 speculative/confidence 指标，并增加 `conditional_confidence/<dataset>/...` 标量。
+
+CDF CSV 中 `probability` 是当前 0.05 区间的概率，`cdf` 是截至该区间上沿的累计概率。对 relative gap，数值 `0.25` 表示失败位置 confidence 比同轮通过均值低 25%，`-0.25` 表示它反而高 25%。
+
+## 8. 运行监控与完整性检查
+
+查看 manifest：
+
+```bash
+/data/home/wly/.conda/envs/dspark/bin/python -m json.tool /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/<时间戳目录>/experiment_manifest.json
+```
+
+查看某数据集聚合进度：
+
+```bash
+watch -n 2 '/data/home/wly/.conda/envs/dspark/bin/python -m json.tool /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/<时间戳目录>/progress/gsm8k/progress.json'
+```
+
+持续查看日志：
+
+```bash
+tail -f /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/<时间戳目录>/eval.log
+```
+
+确认九项全部完成：
+
+```bash
+/data/home/wly/.conda/envs/dspark/bin/python -c 'import json,sys; p=json.load(open(sys.argv[1])); print(p["status"], p["completed_dataset_count"], [(d["name"],d["status"]) for d in p["datasets"]])' /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/<时间戳目录>/experiment_manifest.json
+```
+
+完整全量运行应满足：manifest 的 `status` 为 `completed`、`completed_dataset_count` 为 9、九个 dataset status 全为 `completed`，并且每个数据集都有上述四个聚合文件和所有可见 rank 的 `rank_stats`。不能仅凭进程退出或一张图判断实验完整。

@@ -1,0 +1,797 @@
+"""Observe raw DSpark conditional confidences without changing decoding.
+
+The confidence value used here is ``sigmoid(confidence_logits[k])``.  It is the
+confidence head's probability for token k conditional on the preceding draft
+prefix being accepted; unlike the existing calibration recorder, it is not a
+cumulative product over positions.
+"""
+
+from __future__ import annotations
+
+import csv
+import json
+import math
+import os
+from collections import Counter
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable
+
+import torch
+import torch.distributed as dist
+
+from deepspec.eval.base_evaluator import VerificationResult
+from deepspec.eval.dspark.draft_ops import DSparkDraftProposal
+from deepspec.eval.dspark.evaluator import Qwen3DSparkEvaluator
+from deepspec.utils import CustomJSONEncoder
+
+
+SCHEMA_VERSION = 1
+BIN_WIDTH = 0.05
+CONFIDENCE_MIN_BIN = 0
+CONFIDENCE_MAX_BIN = 19
+SIGNED_GAP_MIN_BIN = -20
+SIGNED_GAP_MAX_BIN = 19
+RANK_CATEGORIES = tuple([str(index) for index in range(1, 11)] + ["other"])
+
+
+def _now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary_path.replace(path)
+
+
+def _finite_or_none(value: float | None) -> float | None:
+    if value is None or not math.isfinite(float(value)):
+        return None
+    return float(value)
+
+
+@dataclass
+class HistogramAccumulator:
+    """Exact count/sum plus a width-0.05 histogram keyed by integer bin."""
+
+    count: int = 0
+    value_sum: float = 0.0
+    minimum: float | None = None
+    maximum: float | None = None
+    bins: Counter[int] = field(default_factory=Counter)
+
+    def add(self, value: float, *, fixed_min: float | None = None, fixed_max: float | None = None) -> None:
+        value = float(value)
+        if not math.isfinite(value):
+            raise ValueError(f"Observation value must be finite, got {value!r}")
+        if fixed_min is not None and value < fixed_min - 1e-7:
+            raise ValueError(f"Observation value {value} is below {fixed_min}")
+        if fixed_max is not None and value > fixed_max + 1e-7:
+            raise ValueError(f"Observation value {value} is above {fixed_max}")
+        value = max(value, fixed_min) if fixed_min is not None else value
+        value = min(value, fixed_max) if fixed_max is not None else value
+        index = math.floor(value / BIN_WIDTH)
+        if fixed_max is not None and math.isclose(value, fixed_max, abs_tol=1e-12):
+            index = math.ceil(fixed_max / BIN_WIDTH) - 1
+        self.count += 1
+        self.value_sum += value
+        self.minimum = value if self.minimum is None else min(self.minimum, value)
+        self.maximum = value if self.maximum is None else max(self.maximum, value)
+        self.bins[int(index)] += 1
+
+    def merge(self, other: "HistogramAccumulator") -> None:
+        self.count += int(other.count)
+        self.value_sum += float(other.value_sum)
+        if other.minimum is not None:
+            self.minimum = other.minimum if self.minimum is None else min(self.minimum, other.minimum)
+        if other.maximum is not None:
+            self.maximum = other.maximum if self.maximum is None else max(self.maximum, other.maximum)
+        self.bins.update(other.bins)
+
+    def to_payload(self) -> dict:
+        return {
+            "count": self.count,
+            "value_sum": self.value_sum,
+            "minimum": self.minimum,
+            "maximum": self.maximum,
+            "bins": {str(index): count for index, count in sorted(self.bins.items())},
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict) -> "HistogramAccumulator":
+        return cls(
+            count=int(payload.get("count", 0)),
+            value_sum=float(payload.get("value_sum", 0.0)),
+            minimum=_finite_or_none(payload.get("minimum")),
+            maximum=_finite_or_none(payload.get("maximum")),
+            bins=Counter({int(key): int(value) for key, value in payload.get("bins", {}).items()}),
+        )
+
+    def report(
+        self,
+        *,
+        min_bin: int | None = None,
+        max_bin: int | None = None,
+        include_zero: bool = False,
+    ) -> dict:
+        if min_bin is None or max_bin is None:
+            if self.bins:
+                observed_min = min(self.bins)
+                observed_max = max(self.bins)
+                min_bin = observed_min if min_bin is None else min_bin
+                max_bin = observed_max if max_bin is None else max_bin
+            else:
+                min_bin = 0 if min_bin is None else min_bin
+                max_bin = -1 if max_bin is None else max_bin
+        if include_zero and max_bin >= min_bin:
+            min_bin = min(min_bin, 0)
+            max_bin = max(max_bin, 0)
+
+        cumulative = 0
+        rows = []
+        for index in range(min_bin, max_bin + 1):
+            bin_count = int(self.bins.get(index, 0))
+            cumulative += bin_count
+            lower = round(index * BIN_WIDTH, 10)
+            upper = round((index + 1) * BIN_WIDTH, 10)
+            rows.append(
+                {
+                    "bin_index": index,
+                    "lower": lower,
+                    "upper": upper,
+                    "interval": f"[{lower:.2f}, {upper:.2f}{']' if index == max_bin else ')'}",
+                    "count": bin_count,
+                    "probability": bin_count / self.count if self.count else None,
+                    "cumulative_count": cumulative,
+                    "cdf": cumulative / self.count if self.count else None,
+                }
+            )
+        return {
+            "count": self.count,
+            "mean": self.value_sum / self.count if self.count else None,
+            "sum": self.value_sum,
+            "minimum": self.minimum,
+            "maximum": self.maximum,
+            "bin_width": BIN_WIDTH,
+            "bins": rows,
+        }
+
+
+@dataclass
+class RankAccumulator:
+    count: int = 0
+    correction_probability_sum: float = 0.0
+    correction_probability_min: float | None = None
+    correction_probability_max: float | None = None
+
+    def add(self, correction_probability: float) -> None:
+        value = float(correction_probability)
+        if not math.isfinite(value) or value < 0.0 or value > 1.0 + 1e-6:
+            raise ValueError(f"Invalid correction-token q_k probability: {value}")
+        self.count += 1
+        self.correction_probability_sum += value
+        self.correction_probability_min = (
+            value if self.correction_probability_min is None else min(self.correction_probability_min, value)
+        )
+        self.correction_probability_max = (
+            value if self.correction_probability_max is None else max(self.correction_probability_max, value)
+        )
+
+    def merge(self, other: "RankAccumulator") -> None:
+        self.count += other.count
+        self.correction_probability_sum += other.correction_probability_sum
+        if other.correction_probability_min is not None:
+            self.correction_probability_min = (
+                other.correction_probability_min
+                if self.correction_probability_min is None
+                else min(self.correction_probability_min, other.correction_probability_min)
+            )
+        if other.correction_probability_max is not None:
+            self.correction_probability_max = (
+                other.correction_probability_max
+                if self.correction_probability_max is None
+                else max(self.correction_probability_max, other.correction_probability_max)
+            )
+
+    def to_payload(self) -> dict:
+        return {
+            "count": self.count,
+            "correction_probability_sum": self.correction_probability_sum,
+            "correction_probability_min": self.correction_probability_min,
+            "correction_probability_max": self.correction_probability_max,
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict) -> "RankAccumulator":
+        return cls(
+            count=int(payload.get("count", 0)),
+            correction_probability_sum=float(payload.get("correction_probability_sum", 0.0)),
+            correction_probability_min=_finite_or_none(payload.get("correction_probability_min")),
+            correction_probability_max=_finite_or_none(payload.get("correction_probability_max")),
+        )
+
+
+class DatasetObservation:
+    """Rank-local sufficient statistics for one dataset."""
+
+    COUNT_KEYS = (
+        "verification_rounds",
+        "proposal_rounds",
+        "zero_draft_proposal_rounds",
+        "fully_accepted_proposal_rounds",
+        "accepted_eos_rounds",
+        "correction_events",
+        "first_position_correction_events",
+        "paired_gap_events",
+        "undefined_relative_gap_events",
+    )
+
+    def __init__(self) -> None:
+        self.counts = Counter({key: 0 for key in self.COUNT_KEYS})
+        self.accepted_confidence = HistogramAccumulator()
+        self.rejected_confidence = HistogramAccumulator()
+        self.signed_gap = HistogramAccumulator()
+        self.signed_relative_gap = HistogramAccumulator()
+        self.true_draft_rank = {category: RankAccumulator() for category in RANK_CATEGORIES}
+
+    def observe(self, proposal: DSparkDraftProposal, verification: VerificationResult) -> None:
+        self.counts["verification_rounds"] += 1
+        proposal_length = int(proposal.draft_token_count)
+        if proposal_length <= 0:
+            self.counts["zero_draft_proposal_rounds"] += 1
+            return
+        self.counts["proposal_rounds"] += 1
+
+        confidence_logits = proposal.confidence_logits
+        if confidence_logits is None:
+            raise RuntimeError("The conditional-confidence experiment requires a confidence head")
+        if confidence_logits.ndim != 2 or confidence_logits.size(0) != 1:
+            raise ValueError(
+                "confidence_logits must have shape [1, proposal_length], got "
+                f"{tuple(confidence_logits.shape)}"
+            )
+        if confidence_logits.size(1) < proposal_length:
+            raise ValueError("confidence_logits is shorter than draft_token_count")
+
+        accepted_count = int(verification.accepted_draft_tokens)
+        if accepted_count < 0 or accepted_count > proposal_length:
+            raise ValueError(
+                f"accepted_draft_tokens={accepted_count} is incompatible with proposal_length={proposal_length}"
+            )
+        conditional_confidences = torch.sigmoid(
+            confidence_logits[0, :proposal_length].detach().float()
+        ).cpu()
+        accepted_values = [float(value) for value in conditional_confidences[:accepted_count].tolist()]
+        for value in accepted_values:
+            self.accepted_confidence.add(value, fixed_min=0.0, fixed_max=1.0)
+
+        if verification.terminated_by_stop_token:
+            self.counts["accepted_eos_rounds"] += 1
+            return
+        if accepted_count >= proposal_length:
+            self.counts["fully_accepted_proposal_rounds"] += 1
+            return
+
+        # Exactly the first rejected position is replaced by verification's
+        # residual/AR token.  Later draft positions are never verified.
+        self.counts["correction_events"] += 1
+        rejected_value = float(conditional_confidences[accepted_count].item())
+        self.rejected_confidence.add(rejected_value, fixed_min=0.0, fixed_max=1.0)
+
+        if accepted_count == 0:
+            self.counts["first_position_correction_events"] += 1
+        else:
+            accepted_mean = sum(accepted_values) / len(accepted_values)
+            signed_gap = accepted_mean - rejected_value
+            self.signed_gap.add(signed_gap, fixed_min=-1.0, fixed_max=1.0)
+            self.counts["paired_gap_events"] += 1
+            if accepted_mean > 0.0:
+                self.signed_relative_gap.add(
+                    signed_gap / accepted_mean,
+                    fixed_max=1.0,
+                )
+            else:  # Sigmoid is positive in exact arithmetic; retain an audit count.
+                self.counts["undefined_relative_gap_events"] += 1
+
+        draft_probs = proposal.draft_probs
+        if draft_probs is None or draft_probs.ndim != 3 or draft_probs.size(0) != 1:
+            raise RuntimeError("Full Markov-corrected q_k is required for true_draft_rank")
+        q_k = draft_probs[0, accepted_count, :].detach().float()
+        correction_token_id = int(verification.next_token.reshape(-1)[0].item())
+        if correction_token_id < 0 or correction_token_id >= q_k.numel():
+            raise ValueError(
+                f"Correction token id {correction_token_id} is outside q_k vocab {q_k.numel()}"
+            )
+        correction_probability = float(q_k[correction_token_id].item())
+        # Competition rank: ties share a rank, determined against the complete q_k.
+        true_rank = 1 + int(torch.count_nonzero(q_k > correction_probability).item())
+        category = str(true_rank) if true_rank <= 10 else "other"
+        self.true_draft_rank[category].add(correction_probability)
+
+    def merge(self, other: "DatasetObservation") -> None:
+        self.counts.update(other.counts)
+        self.accepted_confidence.merge(other.accepted_confidence)
+        self.rejected_confidence.merge(other.rejected_confidence)
+        self.signed_gap.merge(other.signed_gap)
+        self.signed_relative_gap.merge(other.signed_relative_gap)
+        for category in RANK_CATEGORIES:
+            self.true_draft_rank[category].merge(other.true_draft_rank[category])
+
+    def to_payload(self) -> dict:
+        return {
+            "counts": dict(self.counts),
+            "distributions": {
+                "accepted_conditional_confidence": self.accepted_confidence.to_payload(),
+                "rejected_conditional_confidence": self.rejected_confidence.to_payload(),
+                "signed_absolute_gap": self.signed_gap.to_payload(),
+                "signed_relative_gap": self.signed_relative_gap.to_payload(),
+            },
+            "true_draft_rank": {
+                category: self.true_draft_rank[category].to_payload()
+                for category in RANK_CATEGORIES
+            },
+        }
+
+    @classmethod
+    def from_payload(cls, payload: dict) -> "DatasetObservation":
+        observation = cls()
+        observation.counts = Counter(
+            {key: int(payload.get("counts", {}).get(key, 0)) for key in cls.COUNT_KEYS}
+        )
+        distributions = payload.get("distributions", {})
+        observation.accepted_confidence = HistogramAccumulator.from_payload(
+            distributions.get("accepted_conditional_confidence", {})
+        )
+        observation.rejected_confidence = HistogramAccumulator.from_payload(
+            distributions.get("rejected_conditional_confidence", {})
+        )
+        observation.signed_gap = HistogramAccumulator.from_payload(
+            distributions.get("signed_absolute_gap", {})
+        )
+        observation.signed_relative_gap = HistogramAccumulator.from_payload(
+            distributions.get("signed_relative_gap", {})
+        )
+        rank_payload = payload.get("true_draft_rank", {})
+        observation.true_draft_rank = {
+            category: RankAccumulator.from_payload(rank_payload.get(category, {}))
+            for category in RANK_CATEGORIES
+        }
+        return observation
+
+    def build_report(self, *, dataset_name: str, sample_count: int) -> dict:
+        correction_events = int(self.counts["correction_events"])
+        confidence_accepted = self.accepted_confidence.report(
+            min_bin=CONFIDENCE_MIN_BIN,
+            max_bin=CONFIDENCE_MAX_BIN,
+        )
+        confidence_rejected = self.rejected_confidence.report(
+            min_bin=CONFIDENCE_MIN_BIN,
+            max_bin=CONFIDENCE_MAX_BIN,
+        )
+        signed_gap = self.signed_gap.report(
+            min_bin=SIGNED_GAP_MIN_BIN,
+            max_bin=SIGNED_GAP_MAX_BIN,
+        )
+        signed_relative_gap = self.signed_relative_gap.report(include_zero=True)
+        if signed_relative_gap["mean"] is not None:
+            signed_relative_gap["mean_percent"] = 100.0 * signed_relative_gap["mean"]
+        else:
+            signed_relative_gap["mean_percent"] = None
+
+        rank_rows = []
+        for category in RANK_CATEGORIES:
+            rank = self.true_draft_rank[category]
+            rank_rows.append(
+                {
+                    "category": category,
+                    "count": rank.count,
+                    "probability": rank.count / correction_events if correction_events else None,
+                    "correction_q_probability_mean": (
+                        rank.correction_probability_sum / rank.count if rank.count else None
+                    ),
+                    "correction_q_probability_min": rank.correction_probability_min,
+                    "correction_q_probability_max": rank.correction_probability_max,
+                }
+            )
+
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "dataset": dataset_name,
+            "sample_count": int(sample_count),
+            "created_at": _now_iso(),
+            "definitions": {
+                "conditional_confidence": (
+                    "sigmoid(confidence_logits[k]); position-k acceptance confidence "
+                    "conditional on all earlier draft positions being accepted; not cumprod"
+                ),
+                "rejected_position": (
+                    "the first failed draft position in a non-EOS verification round; "
+                    "this is the position replaced by verification.next_token"
+                ),
+                "signed_absolute_gap": "mean(accepted conditional confidences in round) - rejected confidence",
+                "signed_relative_gap": "signed_absolute_gap / mean(accepted conditional confidences in round)",
+                "negative_gap": "the rejected confidence was higher than the same-round accepted-token mean",
+                "true_draft_rank": (
+                    "1 + count_v(q_k[v] > q_k[correction_token]) over the complete "
+                    "Markov-corrected draft distribution; competition ranking for ties"
+                ),
+                "cdf": "cumulative probability through each width-0.05 histogram interval",
+            },
+            "counts": {key: int(self.counts[key]) for key in self.COUNT_KEYS},
+            "distributions": {
+                "accepted_conditional_confidence": confidence_accepted,
+                "rejected_conditional_confidence": confidence_rejected,
+                "signed_absolute_gap": signed_gap,
+                "signed_relative_gap": signed_relative_gap,
+            },
+            "true_draft_rank": {
+                "denominator": correction_events,
+                "categories": rank_rows,
+            },
+        }
+
+
+def merge_observation_payloads(payloads: Iterable[dict]) -> DatasetObservation:
+    merged = DatasetObservation()
+    for payload in payloads:
+        merged.merge(DatasetObservation.from_payload(payload))
+    return merged
+
+
+def summarize_observation_report(report: dict) -> dict:
+    distributions = report["distributions"]
+    rank_probabilities = {
+        row["category"]: row["probability"]
+        for row in report["true_draft_rank"]["categories"]
+    }
+    return {
+        "sample_count": report["sample_count"],
+        "verification_rounds": report["counts"]["verification_rounds"],
+        "accepted_token_count": distributions["accepted_conditional_confidence"]["count"],
+        "accepted_confidence_mean": distributions["accepted_conditional_confidence"]["mean"],
+        "correction_events": report["counts"]["correction_events"],
+        "rejected_confidence_mean": distributions["rejected_conditional_confidence"]["mean"],
+        "first_position_correction_events": report["counts"]["first_position_correction_events"],
+        "paired_gap_events": report["counts"]["paired_gap_events"],
+        "signed_absolute_gap_mean": distributions["signed_absolute_gap"]["mean"],
+        "signed_relative_gap_mean": distributions["signed_relative_gap"]["mean"],
+        "signed_relative_gap_mean_percent": distributions["signed_relative_gap"]["mean_percent"],
+        "true_draft_rank_probabilities": rank_probabilities,
+    }
+
+
+def _write_distribution_csv(path: Path, named_reports: Iterable[tuple[str, dict]]) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=(
+                "metric",
+                "bin_index",
+                "lower",
+                "upper",
+                "interval",
+                "count",
+                "probability",
+                "cumulative_count",
+                "cdf",
+            ),
+        )
+        writer.writeheader()
+        for metric_name, distribution in named_reports:
+            for row in distribution["bins"]:
+                writer.writerow({"metric": metric_name, **row})
+
+
+def _write_rank_csv(path: Path, rank_report: dict) -> None:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        fieldnames = (
+            "category",
+            "count",
+            "probability",
+            "correction_q_probability_mean",
+            "correction_q_probability_min",
+            "correction_q_probability_max",
+        )
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rank_report["categories"])
+
+
+def _plot_report(dataset_dir: Path, report: dict) -> Path:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    distributions = report["distributions"]
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+
+    for key, label in (
+        ("accepted_conditional_confidence", "accepted positions"),
+        ("rejected_conditional_confidence", "replaced position"),
+    ):
+        bins = distributions[key]["bins"]
+        axes[0].plot([row["upper"] for row in bins], [row["cdf"] or 0.0 for row in bins], label=label)
+    axes[0].set(xlabel="raw conditional confidence", ylabel="CDF", xlim=(0, 1), ylim=(0, 1.01))
+    axes[0].grid(alpha=0.25)
+    axes[0].legend()
+
+    for key, label in (
+        ("signed_absolute_gap", "absolute gap"),
+        ("signed_relative_gap", "relative gap"),
+    ):
+        bins = distributions[key]["bins"]
+        if bins:
+            axes[1].plot([row["upper"] for row in bins], [row["cdf"] or 0.0 for row in bins], label=label)
+    axes[1].axvline(0.0, color="0.5", linestyle="--", linewidth=1)
+    axes[1].set(xlabel="signed gap (accepted mean - rejected)", ylabel="CDF", ylim=(0, 1.01))
+    axes[1].grid(alpha=0.25)
+    axes[1].legend()
+
+    rank_rows = report["true_draft_rank"]["categories"]
+    axes[2].bar(
+        [row["category"] for row in rank_rows],
+        [row["probability"] or 0.0 for row in rank_rows],
+    )
+    axes[2].set(xlabel="true_draft_rank category", ylabel="probability", ylim=(0, 1))
+    axes[2].grid(axis="y", alpha=0.25)
+    fig.suptitle(f"{report['dataset']} conditional-confidence observations")
+    fig.tight_layout()
+    output_path = dataset_dir / "observation_plots.png"
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+    return output_path
+
+
+class ConditionalConfidenceRecorder:
+    def __init__(self, *, artifact_root: Path, tensorboard_dir: str | None, step: int | None):
+        self.artifact_root = Path(artifact_root)
+        self.tensorboard_dir = tensorboard_dir
+        self.step = step
+        self.current: DatasetObservation | None = None
+        self.rows: list[dict] = []
+
+    def start(self) -> None:
+        if self.current is not None:
+            raise RuntimeError("Previous dataset observation was not finished")
+        self.current = DatasetObservation()
+
+    def observe(self, *, proposal: DSparkDraftProposal, verification: VerificationResult) -> None:
+        if self.current is None:
+            raise RuntimeError("ConditionalConfidenceRecorder.start() was not called")
+        self.current.observe(proposal, verification)
+
+    def finish(self, *, dataset_name: str, metric_summary: dict, args_payload: dict, tasks: list) -> dict | None:
+        if self.current is None:
+            raise RuntimeError("ConditionalConfidenceRecorder.start() was not called")
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        dataset_dir = self.artifact_root / dataset_name
+        rank_dir = dataset_dir / "rank_stats"
+        rank_payload = {
+            "schema_version": SCHEMA_VERSION,
+            "dataset": dataset_name,
+            "rank": rank,
+            "world_size": world_size,
+            "statistics": self.current.to_payload(),
+        }
+        _write_json_atomic(rank_dir / f"rank_{rank}.json", rank_payload)
+        self.current = None
+        dist.barrier()
+
+        summary = None
+        if rank == 0:
+            payloads = []
+            for source_rank in range(world_size):
+                source_path = rank_dir / f"rank_{source_rank}.json"
+                source_payload = json.loads(source_path.read_text(encoding="utf-8"))
+                if source_payload.get("dataset") != dataset_name:
+                    raise RuntimeError(f"Mismatched rank observation file: {source_path}")
+                payloads.append(source_payload["statistics"])
+            merged = merge_observation_payloads(payloads)
+            report = merged.build_report(
+                dataset_name=dataset_name,
+                sample_count=int(metric_summary["sample_count"]),
+            )
+            output_payload = {
+                "config": {"args": args_payload, "tasks": tasks},
+                "spec_metric_summary": metric_summary,
+                "observation": report,
+                "observation_summary": summarize_observation_report(report),
+            }
+            metrics_path = dataset_dir / "metrics.json"
+            _write_json_atomic(metrics_path, output_payload)
+            _write_distribution_csv(
+                dataset_dir / "conditional_confidence_cdf.csv",
+                (
+                    ("accepted_conditional_confidence", report["distributions"]["accepted_conditional_confidence"]),
+                    ("rejected_conditional_confidence", report["distributions"]["rejected_conditional_confidence"]),
+                ),
+            )
+            _write_distribution_csv(
+                dataset_dir / "signed_gap_cdf.csv",
+                (
+                    ("signed_absolute_gap", report["distributions"]["signed_absolute_gap"]),
+                    ("signed_relative_gap", report["distributions"]["signed_relative_gap"]),
+                ),
+            )
+            _write_rank_csv(dataset_dir / "true_draft_rank.csv", report["true_draft_rank"])
+            _plot_report(dataset_dir, report)
+            summary = output_payload["observation_summary"]
+            self.rows.append({"dataset": dataset_name, **summary})
+            print(
+                "Conditional-confidence observation: "
+                + json.dumps({"dataset": dataset_name, **summary}, ensure_ascii=False, sort_keys=True),
+                flush=True,
+            )
+            print(f"Wrote conditional-confidence artifacts to {dataset_dir}", flush=True)
+        dist.barrier()
+        return summary
+
+    def log_tensorboard(self) -> None:
+        if not self.rows or self.tensorboard_dir is None or self.step is None:
+            return
+        from torch.utils.tensorboard import SummaryWriter
+
+        writer = SummaryWriter(log_dir=self.tensorboard_dir)
+        scalar_keys = (
+            "accepted_confidence_mean",
+            "rejected_confidence_mean",
+            "signed_absolute_gap_mean",
+            "signed_relative_gap_mean",
+            "signed_relative_gap_mean_percent",
+        )
+        for row in self.rows:
+            dataset = row["dataset"]
+            for key in scalar_keys:
+                value = row.get(key)
+                if value is not None and math.isfinite(float(value)):
+                    writer.add_scalar(f"conditional_confidence/{dataset}/{key}", float(value), self.step)
+            for category, value in row.get("true_draft_rank_probabilities", {}).items():
+                if value is not None:
+                    writer.add_scalar(
+                        f"conditional_confidence/{dataset}/true_draft_rank_{category}",
+                        float(value),
+                        self.step,
+                    )
+        writer.close()
+
+    def print_results(self) -> None:
+        if dist.get_rank() != 0 or not self.rows:
+            return
+        from prettytable import PrettyTable
+
+        table = PrettyTable()
+        table.field_names = (
+            "dataset",
+            "accepted_n",
+            "accepted_mean",
+            "corrections",
+            "rejected_mean",
+            "paired_n",
+            "signed_gap_mean",
+            "signed_gap_%",
+            *[f"rank{index}" for index in range(1, 11)],
+            "rank_other",
+        )
+        for row in self.rows:
+            ranks = row["true_draft_rank_probabilities"]
+            fmt = lambda value: "-" if value is None else f"{float(value):.4f}"
+            table.add_row(
+                (
+                    row["dataset"],
+                    row["accepted_token_count"],
+                    fmt(row["accepted_confidence_mean"]),
+                    row["correction_events"],
+                    fmt(row["rejected_confidence_mean"]),
+                    row["paired_gap_events"],
+                    fmt(row["signed_absolute_gap_mean"]),
+                    fmt(row["signed_relative_gap_mean_percent"]),
+                    *[fmt(ranks[str(index)]) for index in range(1, 11)],
+                    fmt(ranks["other"]),
+                )
+            )
+        print("Raw conditional-confidence and correction-rank observations:", flush=True)
+        print(table.get_string(), flush=True)
+
+
+class ConditionalConfidenceEvaluator(Qwen3DSparkEvaluator):
+    """Qwen3 DSpark evaluator with an additional read-only observation hook."""
+
+    def __init__(self, local_rank: int, args):
+        super().__init__(local_rank, args)
+        if self.draft_model.confidence_head is None:
+            raise RuntimeError("Draft checkpoint has no confidence head")
+        self.conditional_confidence_recorder = ConditionalConfidenceRecorder(
+            artifact_root=Path(args.observation_artifact_root),
+            tensorboard_dir=args.tensorboard_dir,
+            step=args.step,
+        )
+        self.observation_summaries: dict[str, dict] = {}
+
+    def mark_dataset_started(self, dataset_name: str) -> None:
+        super().mark_dataset_started(dataset_name)
+        self.conditional_confidence_recorder.start()
+
+    def _post_verify(self, proposal, verification) -> None:
+        # Preserve the existing cumulative-confidence calibration recorder, then
+        # add the isolated raw conditional-confidence observation.
+        super()._post_verify(proposal, verification)
+        if not isinstance(proposal, DSparkDraftProposal):
+            raise TypeError(f"Expected DSparkDraftProposal, got {type(proposal)!r}")
+        self.conditional_confidence_recorder.observe(
+            proposal=proposal,
+            verification=verification,
+        )
+
+    def record_dataset_metrics(self, *, dataset_name: str, metric_summary: dict):
+        self.mark_dataset_phase(dataset_name, "reducing_and_writing_conditional_confidence_observations")
+        summary = self.conditional_confidence_recorder.finish(
+            dataset_name=dataset_name,
+            metric_summary=metric_summary,
+            args_payload=json.loads(json.dumps(vars(self.args), cls=CustomJSONEncoder)),
+            tasks=[list(task) for task in self.tasks],
+        )
+        if summary is not None:
+            self.observation_summaries[dataset_name] = summary
+        return super().record_dataset_metrics(
+            dataset_name=dataset_name,
+            metric_summary=metric_summary,
+        )
+
+    def record_incremental_dataset_result(
+        self,
+        *,
+        metrics_row: dict[str, object],
+        confidence_summary: dict | None = None,
+    ) -> None:
+        if dist.get_rank() != 0:
+            return
+        completed_at = _now_iso()
+        dataset_name = str(metrics_row["dataset"])
+        result = {
+            "dataset": dataset_name,
+            "completed_at": completed_at,
+            "spec": metrics_row,
+            "confidence_summary": confidence_summary,
+            "conditional_confidence_observation_summary": self.observation_summaries.get(dataset_name),
+        }
+        results_value = getattr(self.args, "dataset_results_path", None)
+        if results_value is not None:
+            results_path = Path(results_value)
+            with results_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(result, ensure_ascii=False) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            print(f"Appended dataset result to {results_path}", flush=True)
+        self._update_manifest_dataset(
+            dataset_name,
+            status="completed",
+            phase="completed",
+            completed_at=completed_at,
+            result=result,
+        )
+
+    def log_tensorboard(self) -> None:
+        super().log_tensorboard()
+        self.conditional_confidence_recorder.log_tensorboard()
+
+    def print_results(self) -> None:
+        super().print_results()
+        self.conditional_confidence_recorder.print_results()
+
+
+def evaluation_worker(local_rank: int, args) -> None:
+    if local_rank == 0:
+        print(json.dumps(vars(args), indent=2, ensure_ascii=False, cls=CustomJSONEncoder), flush=True)
+    evaluator = ConditionalConfidenceEvaluator(local_rank, args)
+    try:
+        evaluator.evaluate()
+    finally:
+        evaluator.clean_up()
