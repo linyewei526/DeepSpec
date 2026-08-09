@@ -1,11 +1,10 @@
 """Observe selected-token probabilities from Markov-corrected draft distributions.
 
-For draft position ``k``, the recorded scalar is ``q_k[z_k]``, where ``q_k`` is
-the complete operational draft distribution obtained by applying softmax (and
-the configured sampling temperature) to the Markov-corrected logits, and
-``z_k`` is the token actually proposed at that position.  This is a draft-model
-token probability, not a confidence-head acceptance prediction and not a
-cumulative product over positions.
+For draft position ``k``, the recorded scalar is ``q_k[z_k]``, where
+``q_k = softmax(markov_corrected_logits_k)`` without temperature scaling and
+``z_k`` is the token actually proposed at that position.  This diagnostic
+draft-model probability is separate from the operational proposal distribution
+used by speculative verification.
 """
 
 from __future__ import annotations
@@ -24,12 +23,15 @@ import torch
 import torch.distributed as dist
 
 from deepspec.eval.base_evaluator import VerificationResult
-from deepspec.eval.dspark.draft_ops import DSparkDraftProposal
 from deepspec.eval.dspark.evaluator import Qwen3DSparkEvaluator
 from deepspec.utils import CustomJSONEncoder
+from observations.markov_diagnostic_draft import (
+    DiagnosticMarkovDraftProposal,
+    DiagnosticMarkovProposalMixin,
+)
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 BIN_WIDTH = 0.05
 PROBABILITY_MIN_BIN = 0
 PROBABILITY_MAX_BIN = 19
@@ -244,7 +246,11 @@ class DatasetObservation:
         self.signed_relative_gap = HistogramAccumulator()
         self.true_draft_rank = {category: RankAccumulator() for category in RANK_CATEGORIES}
 
-    def observe(self, proposal: DSparkDraftProposal, verification: VerificationResult) -> None:
+    def observe(
+        self,
+        proposal: DiagnosticMarkovDraftProposal,
+        verification: VerificationResult,
+    ) -> None:
         self.counts["verification_rounds"] += 1
         proposal_length = int(proposal.draft_token_count)
         if proposal_length <= 0:
@@ -252,18 +258,25 @@ class DatasetObservation:
             return
         self.counts["proposal_rounds"] += 1
 
-        draft_probs = proposal.draft_probs
-        if draft_probs is None:
+        diagnostic_logits = proposal.diagnostic_markov_logits
+        if diagnostic_logits is None:
             raise RuntimeError(
-                "The Markov draft-probability experiment requires full draft_probs"
+                "The Markov draft-probability experiment requires diagnostic Markov logits"
             )
-        if draft_probs.ndim != 3 or draft_probs.size(0) != 1:
+        if diagnostic_logits.ndim != 3 or diagnostic_logits.size(0) != 1:
             raise ValueError(
-                "draft_probs must have shape [1, proposal_length, vocab_size], got "
-                f"{tuple(draft_probs.shape)}"
+                "diagnostic_markov_logits must have shape "
+                "[1, proposal_length, vocab_size], got "
+                f"{tuple(diagnostic_logits.shape)}"
             )
-        if draft_probs.size(1) < proposal_length:
-            raise ValueError("draft_probs is shorter than draft_token_count")
+        if diagnostic_logits.size(1) < proposal_length:
+            raise ValueError(
+                "diagnostic_markov_logits is shorter than draft_token_count"
+            )
+        diagnostic_logits = diagnostic_logits[:, :proposal_length, :].detach().float()
+        if not bool(torch.isfinite(diagnostic_logits).all().item()):
+            raise ValueError("Diagnostic Markov logits must be finite")
+        diagnostic_probabilities = torch.softmax(diagnostic_logits, dim=-1)
         if proposal.verify_input_ids.ndim != 2 or proposal.verify_input_ids.size(0) != 1:
             raise ValueError(
                 "verify_input_ids must have shape [1, proposal_length + 1], got "
@@ -280,9 +293,9 @@ class DatasetObservation:
         submitted_token_ids = proposal.verify_input_ids[
             0, 1 : proposal_length + 1
         ].long()
-        selected_probabilities = draft_probs[
+        selected_probabilities = diagnostic_probabilities[
             0, :proposal_length, :
-        ].detach().float().gather(
+        ].gather(
             dim=-1,
             index=submitted_token_ids.unsqueeze(-1),
         ).squeeze(-1).cpu()
@@ -337,18 +350,18 @@ class DatasetObservation:
                 else:  # A selected softmax probability should be positive; retain an audit count.
                     self.counts["undefined_relative_gap_events"] += 1
 
-        draft_probs = proposal.draft_probs
-        if draft_probs is None or draft_probs.ndim != 3 or draft_probs.size(0) != 1:
-            raise RuntimeError("Full Markov-corrected q_k is required for true_draft_rank")
-        q_k = draft_probs[0, accepted_count, :].detach().float()
+        q_k = diagnostic_probabilities[0, accepted_count, :]
+        logits_k = diagnostic_logits[0, accepted_count, :]
         correction_token_id = int(verification.next_token.reshape(-1)[0].item())
         if correction_token_id < 0 or correction_token_id >= q_k.numel():
             raise ValueError(
                 f"Correction token id {correction_token_id} is outside q_k vocab {q_k.numel()}"
             )
         correction_probability = float(q_k[correction_token_id].item())
-        # Competition rank: ties share a rank, determined against the complete q_k.
-        true_rank = 1 + int(torch.count_nonzero(q_k > correction_probability).item())
+        correction_logit = logits_k[correction_token_id]
+        # Softmax is monotonic, so ranking directly in diagnostic logits avoids
+        # artificial ties if tiny float32 probabilities underflow to zero.
+        true_rank = 1 + int(torch.count_nonzero(logits_k > correction_logit).item())
         category = str(true_rank) if true_rank <= 10 else "other"
         self.true_draft_rank[category].add(correction_probability)
 
@@ -472,9 +485,13 @@ class DatasetObservation:
             "created_at": _now_iso(),
             "definitions": {
                 "markov_draft_probability": (
-                    "q_k[z_k], where q_k = softmax(markov_corrected_logits_k / "
-                    "temperature) and z_k is the submitted draft token; at the "
-                    "baseline temperature 1.0 this is softmax(markov_corrected_logits_k)"
+                    "q_obs_k[z_k], where q_obs_k = "
+                    "softmax(markov_corrected_logits_k) without temperature scaling "
+                    "and z_k is the submitted draft token"
+                ),
+                "operational_distribution_separation": (
+                    "speculative verification continues to use the temperature-dependent "
+                    "operational proposal.draft_probs; q_obs_k is diagnostic only"
                 ),
                 "rejected_position": (
                     "the first failed draft position in a non-EOS verification round; "
@@ -506,8 +523,9 @@ class DatasetObservation:
                     "unless the accepted-position mean is zero"
                 ),
                 "true_draft_rank": (
-                    "1 + count_v(q_k[v] > q_k[correction_token]) over the complete "
-                    "Markov-corrected draft distribution; competition ranking for ties"
+                    "1 + count_v(markov_corrected_logits_k[v] > "
+                    "markov_corrected_logits_k[correction_token]) over the complete "
+                    "temperature-independent diagnostic distribution; competition ranking for ties"
                 ),
                 "cdf": "cumulative probability through each width-0.05 histogram interval",
             },
@@ -662,7 +680,12 @@ class MarkovDraftProbabilityRecorder:
             raise RuntimeError("Previous dataset observation was not finished")
         self.current = DatasetObservation()
 
-    def observe(self, *, proposal: DSparkDraftProposal, verification: VerificationResult) -> None:
+    def observe(
+        self,
+        *,
+        proposal: DiagnosticMarkovDraftProposal,
+        verification: VerificationResult,
+    ) -> None:
         if self.current is None:
             raise RuntimeError("MarkovDraftProbabilityRecorder.start() was not called")
         self.current.observe(proposal, verification)
@@ -809,7 +832,10 @@ class MarkovDraftProbabilityRecorder:
         print(table.get_string(), flush=True)
 
 
-class MarkovDraftProbabilityEvaluator(Qwen3DSparkEvaluator):
+class MarkovDraftProbabilityEvaluator(
+    DiagnosticMarkovProposalMixin,
+    Qwen3DSparkEvaluator,
+):
     """Qwen3 DSpark evaluator with an additional read-only observation hook."""
 
     def __init__(self, local_rank: int, args):
@@ -831,8 +857,11 @@ class MarkovDraftProbabilityEvaluator(Qwen3DSparkEvaluator):
         # Preserve the baseline confidence calibration recorder, then add this
         # isolated selected-token Markov draft-probability observation.
         super()._post_verify(proposal, verification)
-        if not isinstance(proposal, DSparkDraftProposal):
-            raise TypeError(f"Expected DSparkDraftProposal, got {type(proposal)!r}")
+        if not isinstance(proposal, DiagnosticMarkovDraftProposal):
+            raise TypeError(
+                "Expected DiagnosticMarkovDraftProposal, got "
+                f"{type(proposal)!r}"
+            )
         self.markov_probability_recorder.observe(
             proposal=proposal,
             verification=verification,

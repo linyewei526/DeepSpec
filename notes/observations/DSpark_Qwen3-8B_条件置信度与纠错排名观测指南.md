@@ -114,7 +114,7 @@ set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN
 | `--target` | Qwen3-8B 本地路径 | target checkpoint。启动前验证本地目录和 `config.json`，不会联网下载。 |
 | `--draft` | block7 本地路径 | DSpark draft checkpoint；必须是 `Qwen3DSparkModel`，并启用 confidence head 与 Markov 修正。 |
 | `--max-new-tokens` | `2048` | 每个样本最多生成 token 数。smoke 可临时设为 `64`。 |
-| `--temperature` | `1.0` | target/draft 采样及验证使用的温度；必须大于 0。 |
+| `--temperature` | `1.0` | target/draft 采样及验证温度，必须有限且不小于 0；`0<=temperature<1e-5` 为精确 greedy。confidence-head 概率仍可观测，但本实验现有 `true_draft_rank` 使用 operational `draft_probs`，在 greedy 下会退化。 |
 | `--confidence-threshold` | `0.0` | draft confidence early-stop 阈值，范围 `[0,1]`。为与 baseline 和全 block 观测一致，全量实验保持 `0.0`。 |
 | `--seed` | `980406` | 数据子采样与逐样本随机采样 seed。 |
 | `--step` | `0` | TensorBoard step 和原有 confidence artifact 的 step 目录。 |

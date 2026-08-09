@@ -359,6 +359,7 @@ nvidia-smi
 
 - 把 `all` 或单个数据集名转换为 evaluator 的 `tasks`；
 - 调用与原始 `eval.py` 相同的 `torch.multiprocessing.spawn` 和 `eval.main`；
+- 启动前自动探测本机空闲 distributed 端口，并与四个观测启动器共享跨进程端口租约，允许多个 DeepSpec 实验并行启动；
 - 把 TensorBoard 和 evaluator artifact 指向本次实验自己的目录；
 - 在加载模型前就创建完整结果目录，写入 `experiment_manifest.json`，并创建空的 `dataset_results.jsonl`、TensorBoard/artifact 和 progress 目录；
 - 运行时由 rank 0 显示跨所有 GPU 聚合的单条 tqdm，每成功完成一个样本就推进该数据集的全局计数；
@@ -377,7 +378,7 @@ YYYYMMDD_HHMMSS_任务名
 ### 7.3 两条样本、64 token smoke test
 
 ```bash
-set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_smoke_gsm8k && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE CUDA_VISIBLE_DEVICES=1 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 MASTER_ADDR=127.0.0.1 MASTER_PORT=29609 python /data/home/wly/dLLM/DeepSpec/runtime/run_experiment.py gsm8k --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 64 --temperature 1.0 --confidence-threshold 0.0 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 --max-samples 2 2>&1 | tee "$RUN_DIR/eval.log"
+set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_smoke_gsm8k && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE -u MASTER_PORT CUDA_VISIBLE_DEVICES=1 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python /data/home/wly/dLLM/DeepSpec/runtime/run_experiment.py gsm8k --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 64 --temperature 1.0 --confidence-threshold 0.0 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 --master-addr 127.0.0.1 --max-samples 2 2>&1 | tee "$RUN_DIR/eval.log"
 ```
 
 这里 `gsm8k` 选择数据集，`--max-samples 2` 把正常的 500 条上限临时覆盖为 2，`--max-new-tokens 64` 把每条样本的最大生成长度临时改为 64；其他参数保持正式实验口径。只暴露一张 GPU，所以 launcher 只 spawn 一个 worker，distributed world size 为 1。结果仍然完整写入独立目录，而不是只打印到终端。
@@ -406,7 +407,7 @@ enable_thinking      = False（evaluator 代码固定）
 ### 8.2 推荐的多卡全量命令（示例使用物理 GPU 2、3）
 
 ```bash
-set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_all && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 MASTER_ADDR=127.0.0.1 MASTER_PORT=29610 python /data/home/wly/dLLM/DeepSpec/runtime/run_experiment.py all --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 2048 --temperature 1.0 --confidence-threshold 0.0 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 2>&1 | tee "$RUN_DIR/eval.log"
+set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_all && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE -u MASTER_PORT CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python /data/home/wly/dLLM/DeepSpec/runtime/run_experiment.py all --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 2048 --temperature 0.0 --confidence-threshold 0.0 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 --master-addr 127.0.0.1 2>&1 | tee "$RUN_DIR/eval.log"
 ```
 
 这是一条物理单行命令；各部分含义如下：  
@@ -418,16 +419,16 @@ set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN
 | `RUN_DIR=.../$(date +%Y%m%d_%H%M%S)_all` | 生成本次全量实验唯一目录名；时间使用当前机器本地时区 |
 | `mkdir "$RUN_DIR"` | 新建目录；若碰撞则停止，绝不覆盖旧实验 |
 | `cd /data/home/wly/dLLM/DeepSpec` | 使 evaluator 的相对路径 `./eval_datasets` 正确解析到仓库数据快照 |
-| `env -u RANK -u WORLD_SIZE` | 清除外部调度器残留；本项目把它们解释为节点 rank/节点数 |
+| `env -u RANK -u WORLD_SIZE -u MASTER_PORT` | 清除外部调度器残留的节点 rank/节点数和固定端口，使启动器执行自动端口预留 |
 | `CUDA_VISIBLE_DEVICES=2,3` | 暴露物理 GPU 2、3；每卡放一份完整 target+draft，样本按 distributed rank 分片 |
 | `PYTHONPATH=.../DeepSpec` | 让 `runtime` 脚本能 import 仓库中的 `eval` 与 `deepspec` |
 | `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1` | 强制只读取已经下载到绝对路径的本地模型 |
-| `MASTER_ADDR`、`MASTER_PORT` | 建立本机 distributed control/metrics process group；并行实验必须使用不同空闲端口 |
+| `--master-addr 127.0.0.1` | 建立本机 distributed control/metrics process group；省略 `--master-port` 时启动器自动探测并租约一个空闲端口 |
 | `run_experiment.py all` | `all` 明确选择固定顺序的全部九个数据集；不要再套 `torchrun` |
 | `--run-dir "$RUN_DIR"` | 将本次 manifest、TensorBoard 和 artifact 全部绑定到唯一目录 |
 | `--target`、`--draft` | 指定 Qwen3-8B target 和 DSpark block-7 checkpoint |
 | `--max-new-tokens` | 每条样本最多生成 2048 个新 token；EOS 可使其提前结束 |
-| `--temperature` | target/draft 分布都按温度 1.0 采样；不是 greedy decoding |
+| `--temperature` | 示例值 1.0 表示 target/draft 按温度分布采样；参数必须有限且不小于 0，`0<=temperature<1e-5` 时 target/draft 均使用 argmax/one-hot，得到 target greedy decoding |
 | `--confidence-threshold` | 0.0 表示不基于 confidence 截断，同时启用 confidence 指标记录器 |
 | `--seed` | 控制数据 shuffle 和每条样本的随机采样种子 |
 | `--step` | 写入 `step_0` artifact 层级，并作为 TensorBoard scalar step；不是 checkpoint step |
@@ -441,7 +442,7 @@ set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN
 
 若只有物理 GPU 2 空闲，只把示例命令中的 `CUDA_VISIBLE_DEVICES=2,3` 改为 `CUDA_VISIBLE_DEVICES=2`。若实际空闲的是两张不连续卡，可写 `CUDA_VISIBLE_DEVICES=1,3`；进程内部看到的是逻辑 `cuda:0,1`。减少 GPU 数主要增加 wall-clock：它不会做 tensor parallel，而是每卡完整复制 target+draft，再以 `samples[rank::world_size]` 分数据。多进程并发加载还会占用更多主机内存。
 
-不要用 `torchrun`。`run_experiment.py` 已调用 `torch.multiprocessing.spawn(..., nprocs=torch.cuda.device_count())`。同机另开实验时必须同时换一个 `MASTER_PORT`；时间戳结果目录解决的是文件隔离，不能解决 distributed 端口冲突。
+不要用 `torchrun`。`run_experiment.py` 已调用 `torch.multiprocessing.spawn(..., nprocs=torch.cuda.device_count())`。默认省略 `--master-port` 时，launcher 会探测当前可绑定端口，并在 `/tmp/deepspec_conditional_confidence_ports/` 与四个观测启动器共享租约；同机多个 DeepSpec 实验可并行启动，无需人工更换端口。如果为调试显式传入 `--master-port N`，该端口已被占用或租约时会立即报错。
 
 评测路径不使用 DDP、tensor parallel 或任何推理期跨卡通信：每张卡独立处理自己的样本，只有一项结束后才归约少量整数计数和 confidence histogram。这里默认用 Gloo 是为了避免活跃 GPU 上的小型 NCCL collective 卡死；Gloo 只搬运 CPU 指标，不会把 target/draft 模型或 logits 移到 CPU，也不改变采样结果。
 
@@ -528,7 +529,7 @@ watch -n 2 python -m json.tool /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/202
 ### 9.2 单独运行 GSM8K 的四卡命令
 
 ```bash
-set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_gsm8k && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE CUDA_VISIBLE_DEVICES=0,1,2,3 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 MASTER_ADDR=127.0.0.1 MASTER_PORT=29611 python /data/home/wly/dLLM/DeepSpec/runtime/run_experiment.py gsm8k --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 2048 --temperature 1.0 --confidence-threshold 0.0 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 2>&1 | tee "$RUN_DIR/eval.log"
+set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_gsm8k && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE -u MASTER_PORT CUDA_VISIBLE_DEVICES=0,1,2,3 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python /data/home/wly/dLLM/DeepSpec/runtime/run_experiment.py gsm8k --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 2048 --temperature 1.0 --confidence-threshold 0.0 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 --master-addr 127.0.0.1 2>&1 | tee "$RUN_DIR/eval.log"
 ```
 
 要改跑 `math500`，同时把时间戳目录末尾的 `_gsm8k` 改成 `_math500`，并把 `run_experiment.py gsm8k` 改成 `run_experiment.py math500`；其他八项同理。目录后缀只是方便人阅读，真正决定数据集的是 Python 的位置参数，manifest 会记录实际选择，所以二者应保持一致。
@@ -581,7 +582,7 @@ set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN
 - `mode` 以及 `datasets`：实际数据集名、文件绝对路径、配置/有效样本上限、文件总行数、SHA256，以及每项的 `status/phase/started_at/completed_at/result`；
 - `models`：target 与 draft 的本地绝对路径；
 - `hyperparameters`：`max_new_tokens`、`temperature`、`confidence_threshold`、`seed`、`step`、`max_samples_override`、`dist_timeout_minutes`，以及代码固定的 non-thinking、block size 7、batch size 1、SDPA；
-- `distributed`：可见 GPU 编号/数量/型号、master 地址和端口、Gloo/NCCL backend、数据并行语义；
+- `distributed`：可见 GPU 编号/数量/型号、master 地址和实际预留端口、端口来源与租约路径、Gloo/NCCL backend、数据并行语义；
 - `environment`：工作目录、主机名、Python 可执行文件和版本、torch/transformers/CUDA 版本、offline 开关；
 - `repository`：仓库绝对路径、Git commit 和运行时 worktree 状态；
 - `invocation/outputs/error`：Python 命令、manifest、增量 JSONL、progress、日志、TensorBoard/artifact 的所有位置，以及失败时的异常详情。
@@ -702,10 +703,9 @@ python -c 'import torch, transformers; print(torch.__version__, transformers.__v
 ### 12.2 Distributed 初始化、端口或指标归约卡住
 
 - 不要用 `torchrun`；
-- `unset RANK WORLD_SIZE`；
-- 设一个不同的 `MASTER_PORT`；
+- `unset RANK WORLD_SIZE MASTER_PORT`，或使用指南命令中的 `env -u RANK -u WORLD_SIZE -u MASTER_PORT`；
 - 确认 `CUDA_VISIBLE_DEVICES` 至少一张卡；
-- 多个评测 job不能共享同一个端口；
+- 正常并行运行时不要传 `--master-port`，交给启动器自动预留；如显式指定端口，占用/租约冲突会在模型加载前报错；
 - 正式评测保留 `--dist-backend gloo`，不要无理由改回 NCCL。
 
 当前按 `samples[rank::world_size]` 静态分片，不同样本的实际输出长度差异很大，快 rank 可能先完成，慢 rank 仍在生成。旧实现使用 GPU NCCL 归约末尾的几个计数；在 GPU 上还有其他活跃进程时，曾出现两个 rank 都完成样本、NCCL kernel 却持续自旋的情况。当前评测默认改用 CPU Gloo 归约，tqdm 进度也只通过文件聚合，不依赖 GPU collective。`--dist-timeout-minutes 1440` 仍用于允许快慢 rank 长时间不均衡；它只延长等待上限，不改变采样、accepted length 或数据集结果。
@@ -756,10 +756,10 @@ readlink -f /data/home/wly/dLLM/DeepSpec/eval_datasets
 完成 Table 1 复现后，可以改变 `--confidence-threshold`。例如下面是 threshold=0.4 的独立全量实验；它仍会创建自己的时间戳目录、manifest、日志和 TensorBoard：
 
 ```bash
-set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_all_thr0p4 && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE CUDA_VISIBLE_DEVICES=0,1,2,3 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 MASTER_ADDR=127.0.0.1 MASTER_PORT=29612 python /data/home/wly/dLLM/DeepSpec/runtime/run_experiment.py all --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 2048 --temperature 1.0 --confidence-threshold 0.4 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 2>&1 | tee "$RUN_DIR/eval.log"
+set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_all_thr0p4 && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE -u MASTER_PORT CUDA_VISIBLE_DEVICES=0,1,2,3 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python /data/home/wly/dLLM/DeepSpec/runtime/run_experiment.py all --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 2048 --temperature 1.0 --confidence-threshold 0.4 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 --master-addr 127.0.0.1 2>&1 | tee "$RUN_DIR/eval.log"
 ```
 
-做 0.2/0.4/0.6/0.8 sweep 时，每次分别修改 threshold、目录后缀（如 `_all_thr0p2`）和 `MASTER_PORT`，执行四条独立命令；不要把四次运行写进同一目录。注意当前 recorder 只在 threshold 恰为 0 时启用，所以 threshold>0 的目录中预期有 manifest、逐项追加的 `dataset_results.jsonl`、进度快照、`eval.log` 和 TensorBoard spec scalar，但没有 `metrics.json`/confidence reliability plot；比较静态阈值实验时优先读取各自的 `dataset_results.jsonl`。
+做 0.2/0.4/0.6/0.8 sweep 时，每次只需分别修改 threshold 和目录后缀（如 `_all_thr0p2`），可以并行执行四条独立命令；端口由各 launcher 自动预留，不要显式传 `--master-port`，也不要把四次运行写进同一目录。注意当前 recorder 只在 threshold 恰为 0 时启用，所以 threshold>0 的目录中预期有 manifest、逐项追加的 `dataset_results.jsonl`、进度快照、`eval.log` 和 TensorBoard spec scalar，但没有 `metrics.json`/confidence reliability plot；比较静态阈值实验时优先读取各自的 `dataset_results.jsonl`。
 
 这会在第一个 `sigmoid(z_k) < threshold` 的位置之前截断 proposal，其中 $z_k$ 是 confidence head 的 raw logit。预期阈值越高：
 

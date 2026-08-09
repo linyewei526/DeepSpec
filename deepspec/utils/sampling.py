@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+import math
+
 import torch
 
 
+def _validate_temperature(temperature: float) -> float:
+    value = float(temperature)
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(f"temperature must be finite and non-negative, got {temperature!r}")
+    return value
+
+
 def logits_to_probs(logits: torch.Tensor, temperature: float) -> torch.Tensor:
+    temperature = _validate_temperature(temperature)
     if temperature < 1e-5:
         probs = torch.zeros_like(logits, dtype=torch.float32)
         probs.scatter_(-1, torch.argmax(logits, dim=-1, keepdim=True), 1.0)
@@ -18,6 +28,7 @@ def sample_from_probs(probs: torch.Tensor) -> torch.Tensor:
 
 
 def sample_tokens(logits: torch.Tensor, temperature: float = 0.0) -> torch.Tensor:
+    temperature = _validate_temperature(temperature)
     if temperature < 1e-5:
         return torch.argmax(logits, dim=-1)
 

@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -29,6 +31,9 @@ DATASET_ROOT = REPO_ROOT / "eval_datasets"
 RESULT_ROOT = Path("/data/home/wly/dLLM/DeepSpec-results/qwen3_8b")
 DEFAULT_TARGET = Path("/data1/linyewei/models/Qwen3-8B")
 DEFAULT_DRAFT = Path("/data1/linyewei/models/dspark_qwen3_8b_block7")
+# Keep this path identical to all observation launchers so baseline and
+# observation jobs participate in the same cross-process port lease protocol.
+PORT_LEASE_ROOT = Path("/tmp/deepspec_conditional_confidence_ports")
 DATASET_CAPS = OrderedDict(
     [
         ("gsm8k", 500),
@@ -59,6 +64,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--step", type=int, default=0)
     parser.add_argument("--dist-timeout-minutes", type=int, default=24 * 60)
     parser.add_argument("--dist-backend", choices=("gloo", "nccl"), default="gloo")
+    parser.add_argument(
+        "--master-addr",
+        default=os.environ.get("MASTER_ADDR", "127.0.0.1"),
+    )
+    parser.add_argument(
+        "--master-port",
+        type=int,
+        default=None,
+        help="Explicit distributed port. If omitted, reserve a currently free local port.",
+    )
     parser.add_argument(
         "--max-samples",
         type=int,
@@ -121,12 +136,83 @@ def build_tasks(dataset: str, max_samples: int | None) -> list[tuple[str, int]]:
     return selected
 
 
+def _port_is_bindable(master_addr: str, port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+            sock.bind((master_addr, port))
+        return True
+    except OSError:
+        return False
+
+
+def reserve_master_port(
+    master_addr: str,
+    requested_port: int | None,
+    run_dir: Path,
+) -> tuple[int, Path, str]:
+    """Reserve a free distributed port across concurrent DeepSpec launches."""
+
+    PORT_LEASE_ROOT.mkdir(parents=True, exist_ok=True)
+    attempts = 1 if requested_port is not None else 100
+    for _ in range(attempts):
+        if requested_port is None:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.bind((master_addr, 0))
+                port = int(probe.getsockname()[1])
+        else:
+            port = int(requested_port)
+        if port < 1 or port > 65535:
+            raise ValueError("--master-port must be in [1, 65535]")
+        if not _port_is_bindable(master_addr, port):
+            if requested_port is not None:
+                raise RuntimeError(
+                    "Requested distributed port is already in use: "
+                    f"{master_addr}:{port}"
+                )
+            continue
+        lease_path = PORT_LEASE_ROOT / f"{port}.json"
+        try:
+            descriptor = os.open(
+                lease_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+        except FileExistsError:
+            if requested_port is not None:
+                raise RuntimeError(
+                    "Requested distributed port is leased by another DeepSpec run: "
+                    f"{port}"
+                )
+            continue
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "pid": os.getpid(),
+                    "master_addr": master_addr,
+                    "master_port": port,
+                    "run_dir": str(run_dir),
+                    "created_at": now_iso(),
+                },
+                handle,
+                ensure_ascii=False,
+                indent=2,
+            )
+            handle.write("\n")
+        return port, lease_path, "explicit" if requested_port is not None else "auto_reserved"
+    raise RuntimeError("Could not reserve a free distributed port after 100 attempts")
+
+
+def release_port_lease(lease_path: Path) -> None:
+    lease_path.unlink(missing_ok=True)
+
+
 def main() -> None:
     cli = parse_args()
     if cli.max_new_tokens <= 0:
         raise ValueError("--max-new-tokens must be positive")
-    if cli.temperature <= 0:
-        raise ValueError("--temperature must be positive")
+    if not math.isfinite(cli.temperature) or cli.temperature < 0.0:
+        raise ValueError("--temperature must be finite and non-negative")
     if cli.confidence_threshold < 0:
         raise ValueError("--confidence-threshold must be non-negative")
     if cli.max_samples is not None and cli.max_samples <= 0:
@@ -186,6 +272,17 @@ def main() -> None:
     if cuda_device_count < 1:
         raise RuntimeError("No visible CUDA device; check CUDA_VISIBLE_DEVICES and PyTorch CUDA support")
 
+    master_port, port_lease_path, port_source = reserve_master_port(
+        cli.master_addr,
+        cli.master_port,
+        run_dir,
+    )
+    os.environ["MASTER_ADDR"] = cli.master_addr
+    os.environ["MASTER_PORT"] = str(master_port)
+    # Also cover errors before the spawn try/finally (for example artifact
+    # creation or evaluator import failures). Normal completion unregisters it.
+    atexit.register(release_port_lease, port_lease_path)
+
     start_wall = time.time()
     manifest = {
         "schema_version": 2,
@@ -202,6 +299,7 @@ def main() -> None:
         "hyperparameters": {
             "max_new_tokens": cli.max_new_tokens,
             "temperature": cli.temperature,
+            "temperature_mode": "greedy" if cli.temperature < 1e-5 else "sampling",
             "confidence_threshold": cli.confidence_threshold,
             "seed": cli.seed,
             "step": cli.step,
@@ -217,8 +315,10 @@ def main() -> None:
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
             "visible_gpu_count": cuda_device_count,
             "visible_gpu_names": gpu_names(cuda_device_count),
-            "master_addr": os.environ.get("MASTER_ADDR"),
-            "master_port": os.environ.get("MASTER_PORT"),
+            "master_addr": cli.master_addr,
+            "master_port": master_port,
+            "master_port_source": port_source,
+            "port_lease_path": str(port_lease_path),
             "input_rank": os.environ.get("RANK"),
             "input_world_size": os.environ.get("WORLD_SIZE"),
             "backend": cli.dist_backend,
@@ -260,6 +360,11 @@ def main() -> None:
     print(f"Experiment directory: {run_dir}", flush=True)
     print(f"Experiment manifest: {manifest_path}", flush=True)
     print(f"Incremental dataset results: {dataset_results_path}", flush=True)
+    print(
+        f"Reserved distributed endpoint: {cli.master_addr}:{master_port} "
+        f"({port_source})",
+        flush=True,
+    )
 
     worker_args = SimpleNamespace(
         target_name_or_path=str(target),
@@ -315,7 +420,11 @@ def main() -> None:
                     dataset_record["status"] = "failed"
                     dataset_record["phase"] = "failed"
                     dataset_record["failed_at"] = now_iso()
-        write_manifest(manifest_path, final_manifest)
+        try:
+            write_manifest(manifest_path, final_manifest)
+        finally:
+            release_port_lease(port_lease_path)
+            atexit.unregister(release_port_lease)
 
 
 if __name__ == "__main__":

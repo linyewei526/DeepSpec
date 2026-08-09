@@ -34,3 +34,21 @@
 - 复核当时唯一的提交后差异是 `notes/DSpark_prompt.md` 新记录了当前用户请求；本次对 `quicknote.md`/`codexnote.md` 的更新也会在下次提交前显示为新差异。后续始终以实时 `git status` 为准，不要覆盖任何提交后用户变更。
 - 已完成的基线报告是 speculative decoding 与 confidence 指标，当前 evaluator 不等价于九项 benchmark 的最终 accuracy/pass@1/judge 评分。
 - 当前推理是 Hugging Face/PyTorch + SDPA、batch size 1 的原生实现，没有接入 vLLM/SGLang 等 serving engine；后续推理优化应以上述成功实验为基线。
+
+时间戳（增量交接）：2026-08-07 18:08:45 CST (UTC+08:00)
+
+## 2026-08-07 新增观测实验
+
+- 已在 `observations/` 下新增四个相互隔离的子实验：`conditional_confidence/`、`confidence_drop_rejection/`、`markov_draft_probability/`、`markov_probability_drop_rejection/`；对应说明和单行运行命令见 `notes/observations/` 下四份 Qwen3-8B 观测指南。
+- confidence-head 条件置信度/纠错排名全量实验已完成：`/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/20260807_105942_conditional_confidence_all/`。
+- confidence-head 置信度下降/拒绝预测全量实验已完成：`/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/20260807_153909_confidence_drop_rejection_all/`；根目录 `confidence_drop_results.md` 是逐数据集追加的两张阈值表。
+- Markov 草稿概率实验旧 schema v1 目录 `20260807_173321_markov_draft_probability_all` 已失败终止，仅 GSM8K 是已完成聚合结果；其负 gap 口径已废止。当前 schema v2 会排除 `signed_absolute_gap < 0` 的事件并保留审计计数，代码和说明见 `observations/markov_draft_probability/` 及对应指南；`20260807_180318_markov_draft_probability_all` 在本时间戳仍在运行，后续以实时 manifest 为准。
+- Markov 草稿概率下降/拒绝预测实验的代码和指南已完成，但本时间戳尚无全量结果目录。以上观测代码最初提交于 `87cb79f`，Markov 负 gap 过滤提交于当前 `46a7c45`；更新本交接前 `HEAD=origin/main=46a7c45`，工作树仅有用户维护的 `notes/DSpark_prompt.md` 差异，追加本记录后还会包含两份 memory 文档差异。
+
+时间戳（增量交接）：2026-08-08 09:58:35 CST (UTC+08:00)
+
+## Greedy 温度与 Markov diagnostic 概率
+
+- `eval.py`、`runtime/run_experiment.py` 和四个观测启动器现均支持 `temperature=0.0`；`0<=temperature<1e-5` 为精确 greedy，负数及非有限温度会报错，settings 记录 `temperature_mode`。
+- 两组 Markov 观测已将概率定义改为温度无关的 `softmax(markov_corrected_logits)`，并与 verifier 使用的 operational `draft_probs` 分离；Markov 概率/排名为 schema 3，Markov 下降/拒绝预测为 schema 2。共用隔离实现见 `observations/markov_diagnostic_draft.py`，完整定义见两份 Markov 观测指南。
+- 两个单样本 greedy 集成 smoke 已完成：`20260808_095658_markov_diagnostic_greedy_smoke_gsm8k` 和 `20260808_095737_markov_diagnostic_drop_greedy_smoke_gsm8k`。旧 schema 结果保持不变，不能与新 diagnostic 口径混合。

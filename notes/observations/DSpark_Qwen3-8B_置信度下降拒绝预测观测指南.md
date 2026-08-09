@@ -172,7 +172,7 @@ set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN
 | `--target` | Qwen3-8B 路径 | 本地 target checkpoint。 |
 | `--draft` | DSpark block7 路径 | 本地 Qwen3 DSpark checkpoint，必须启用 confidence head。 |
 | `--max-new-tokens` | `2048` | 每个样本最多生成 token 数；smoke 可改小。 |
-| `--temperature` | `1.0` | target/draft 采样与验证温度，必须大于 0。 |
+| `--temperature` | `1.0` | target/draft 采样与验证温度，必须有限且不小于 0；`0<=temperature<1e-5` 为精确 greedy。confidence-head 条件接收概率本身不做温度 softmax。 |
 | `--confidence-threshold` | `0.0` | DSpark proposal early-stop 阈值；与 baseline 及完整七位置观测对齐时保持 0。 |
 | `--seed` | `980406` | 数据子采样及逐样本采样 seed。 |
 | `--step` | `0` | TensorBoard step 和父类 confidence artifact 的 step。 |

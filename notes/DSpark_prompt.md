@@ -51,3 +51,17 @@ DSpark针对Qwen3-8B模型的实验和训练是指Qwen/Qwen3-8B吗，代码或�
 好的，回到刚刚的任务，现在请你：1.在/data/home/wly/dLLM/DeepSpec/notes/memory里有一个quicknote.md文档，开头是一个时间戳，内容是尽可能清晰简洁地告诉我在当前会话内，我们针对/data/home/wly/dLLM/DeepSpec项目做了什么分析和修改，便于我查阅和其他合作者后续跟进研究。注意不用详细说明具体内容、技术点、分析等，你只需要简洁地记录目前做了哪些事，具体内容或代码可以参见哪个文档或目录等，便于我和合作者之后快速对齐当前项目进展，清晰完整精确就行，不要长篇大论。现在请你参照quicknote.md文档内此前交接记录的内容，在末尾追加新的当前时间戳并记录新增的交接文档。2.在/data/home/wly/dLLM/DeepSpec/notes/memory里有一个codexnote.md文档，在会话最开始让你读过，开头是一个时间戳，这个文档用于之后我如果开一个全新的codex终端会话，在没有上下文的情况下，codex可以通过这个文档的指导步骤和描述对齐对当前DeepSpec项目的理解(包括解码方式、算法原理、代码组织形式等)，对齐当前的项目进度，便于在把这个文档给codex新会话后，新会话能从当前位置和进度继续进行。这个指导文档不用把左右内容和理解都再写一遍，例如论文、算法原理、代码组织和实验复现此前已经整理在了/data/home/wly/dLLM/DeepSpec/notes/basis中，这个codexnote.md可以指导codex新会话怎么去读、理解和对齐当前项目。目标是我只需要告诉新会话按照这个codexnote.md的指导步骤和描述对齐对当前项目，新会话就能从当前理解和进度继续进行。现在请你参照quicknote.md文档内此前交接记录的内容，在末尾追加新的当前时间戳并记录新增的内容文档。先不要修改文档，阅读这两份文档当前状态并告诉我是否明白我的意思，是否能完成。
 
 先不急，刚刚在运行/data/home/wly/dLLM/DeepSpec/notes/observations/DSpark_Qwen3-8B_Markov修正草稿概率与纠错排名观测指南.md指导的实验时，发现gsm8k运行结果/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/20260807_173321_markov_draft_probability_all/dataset_results.jsonl显示"signed_relative_gap_mean": -2.203678118588745，这很不合理啊，/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/20260807_173321_markov_draft_probability_all/observations/markov_draft_probability/gsm8k/observation_plots.png中间那幅图极端值出现了-8000。这可能是因为温度>0情况下在极端样本上选取了一个概率值极小的token。现在请你修改Markov修正草稿概率与纠错排名观测实验(此前confidence head对应的实验不用修改了)并更新文档，对于signed gap的所有计数和后续分布统计不考虑signed gap<0的情况。先不要改代码，先告诉我你是否能明白我的意思，并做分析，这个修改是否可行？
+
+好的，开始追加两份文档吧。完成后请你作为codex会话仔细检查更新后的codexnote.md，是否能让一个新的codex会话根据这份文档成功精准理解当前项目并对其当前进度，便于无缝衔接继续任务和对话。
+
+我有两个问题：1.为什么runtime/run_experiment.py 和四个观测实验启动器目前要求 temperature 严格大于 0，传 0.0 会直接报错？如果传--temperature 0.000001对复现实验和观测实验都能转为取最大概率token提交的greedy模式吗？2.为什么如果运行 Markov 草稿概率或纠错排名观测，greedy 模式下 operational q_k 会变成 one-hot，所选 draft token 的 q_k[z_k] 基本恒为 1，draft token 的 q_k不是经过markov修正后的logits取softmax的结果吗，为什么会变成1？
+
+我希望对代码做这样的修改：1.对runtime/run_experiment.py 和四个观测实验启动器以及你检查到所有不支持0.0的temperature的代码，通过校验从 <= 0 改成 < 0等方式使其能够支持temperature=0.0的greedy解码。2.对Markov草稿概率和纠错排名观测，Markov修正草稿概率下降拒绝预测两组markov实验，将草稿概率/置信度定义为经过markov修正后的logits取softmax的结果，即softmax(markov_corrected_logits)，不受温度的影响。先不要改代码，先告诉我你是否能明白我的意思，并做分析，这个修改是否可行？
+
+markov实验的true_draft_rank 一并切换到 diagnostic logits/probability，现在开始对温度支持和草稿概率定义做修改吧。
+
+现在/data/home/wly/dLLM/DeepSpec/notes/basis/DSpark_Qwen3-8B_推理复现指南.md里的复现实验还指定MASTER_PORT=29610，如果我希望将复现实验与其他实验并行，能够自主搜索可用端口，这个指定是否可行，还是要修改命令行？
+
+修改相关代码和文档中命令行使其与后续实验一样不发生端口冲突，能多个实验并行。
+
+现在请你：1.在/data/home/wly/dLLM/DeepSpec/notes/memory里有一个quicknote.md文档，开头是一个时间戳，内容是尽可能清晰简洁地告诉我在当前会话内，我们针对/data/home/wly/dLLM/DeepSpec项目做了什么分析和修改，便于我查阅和其他合作者后续跟进研究。注意不用详细说明具体内容、技术点、分析等，你只需要简洁地记录目前做了哪些事，具体内容或代码可以参见哪个文档或目录等，便于我和合作者之后快速对齐当前项目进展，清晰完整精确就行，不要长篇大论。现在请你参照quicknote.md文档内此前交接记录的内容，在末尾追加新的当前时间戳并记录新增的交接文档。2.在/data/home/wly/dLLM/DeepSpec/notes/memory里有一个codexnote.md文档，在会话最开始让你读过，开头是一个时间戳，这个文档用于之后我如果开一个全新的codex终端会话，在没有上下文的情况下，codex可以通过这个文档的指导步骤和描述对齐对当前DeepSpec项目的理解(包括解码方式、算法原理、代码组织形式等)，对齐当前的项目进度，便于在把这个文档给codex新会话后，新会话能从当前位置和进度继续进行。这个指导文档不用把左右内容和理解都再写一遍，例如论文、算法原理、代码组织和实验复现此前已经整理在了/data/home/wly/dLLM/DeepSpec/notes/basis中，这个codexnote.md可以指导codex新会话怎么去读、理解和对齐当前项目。目标是我只需要告诉新会话按照这个codexnote.md的指导步骤和描述对齐对当前项目，新会话就能从当前理解和进度继续进行。3.不要追加新的时间戳重写内容了，只需要你基于最新的修改，包括支持0.0的temperature、markov实验将草稿概率/置信度定义为经过markov修正后的logits取softmax的结果softmax(markov_corrected_logits)、复现实验对自动搜寻可用端口的支持，在现有的quicknote.md和codexnote.md文档内做相应的修改和更新。这些修改都是此前实验的一些细节修改，在各自的实验文档里应该也已经更新了描述，所以你只需要检查让quicknote.md和codexnote.md能识别到这些修改就行，不需要长篇大论。先不要修改，你能明白我意思吗？

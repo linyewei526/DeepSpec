@@ -1,6 +1,7 @@
 from __future__ import annotations
 import argparse
 import json
+import math
 import torch
 from transformers import AutoConfig
 from deepspec.eval.dspark import Gemma4DSparkEvaluator, Qwen3DSparkEvaluator
@@ -45,6 +46,8 @@ def parse_args():
     parser.add_argument("--dist-timeout-minutes", type=int, default=24 * 60)
     parser.add_argument("--dist-backend", choices=("gloo", "nccl"), default="gloo")
     args = parser.parse_args()
+    if not math.isfinite(args.temperature) or args.temperature < 0.0:
+        parser.error("--temperature must be finite and non-negative")
     args.tasks = list(TASKS)
     return args
 

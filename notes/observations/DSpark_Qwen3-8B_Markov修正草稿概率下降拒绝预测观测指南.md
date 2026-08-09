@@ -10,19 +10,19 @@
 
 ## 2. Markov 修正草稿概率与前缀均值
 
-对于一次 draft forward 产生的序列，令位置 $i$ 的 Markov 修正 operational draft 分布为
+对于一次 draft forward 产生的序列，令位置 $i$ 的 Markov 修正 logits 为 $\ell_i$。本实验定义温度无关 diagnostic 分布为
 
 \[
-q_i=\operatorname{softmax}(\operatorname{markov\_corrected\_logits}_i/T).
+q_i^{obs}=\operatorname{softmax}(\ell_i).
 \]
 
 实际提交验证的 draft token 记为 $z_i$，本实验使用的标量为
 
 \[
-P_i=q_i(z_i).
+P_i=q_i^{obs}(z_i).
 \]
 
-基准参数 `temperature=1.0` 时，$q_i$ 就是 Markov 修正 logits 的普通 softmax；若修改温度，记录的是推理和 verify 实际使用的 `softmax(logits / temperature)`。$P_i$ 是 draft 模型对实际提交 token 的概率质量，不是 confidence head 接收概率、不是累积概率，也不是 speculative acceptance probability。
+$q_i^{obs}$ 始终直接对 Markov 修正 logits 做普通 softmax，不执行 `/temperature`。采样和 speculative verification 仍使用另一份 operational 分布 $q_i^{verify}$：`temperature>=1e-5` 时为 $\operatorname{softmax}(\ell_i/T)$，`0<=temperature<1e-5` 时为 greedy argmax 的 one-hot 分布。$q_i^{obs}$ 仅供观测，绝不替换 verifier 的 `proposal.draft_probs`，因此 greedy 下 $P_i$ 通常仍小于 1，可以继续进行下降分析。这里的“温度无关”只表示从当前 $\ell_i$ 到概率的映射不除以温度；不同温度可能改变已采样 prefix，从而间接改变后续位置的 $\ell_i$。
 
 对 $i\ge1$，此前位置均值定义为
 
@@ -95,10 +95,11 @@ absolute 和 percentage 的每个阈值都输出：
 - `observations/markov_probability_drop_rejection/markov_probability_drop_observation.py`：同轮前缀均值、GPU 阈值计数、标签映射、跨 rank 归约和结果产物；
 - `observations/markov_probability_drop_rejection/run_markov_probability_drop_observation.py`：本地 checkpoint/data 校验、时间戳目录、不可变 settings、自动端口租约、manifest 和多 GPU 启动；
 - `observations/markov_probability_drop_rejection/summarize_markov_probability_drop_observation.py`：只读汇总和阈值筛选。
+- `observations/markov_diagnostic_draft.py`：两组 Markov 观测共用的隔离 proposal mixin；同时保留 verifier 的 operational `draft_probs` 和只供观测的 corrected logits。
 
-调用链为 `run_markov_probability_drop_observation.py -> torch.multiprocessing.spawn -> MarkovProbabilityDropEvaluator -> Qwen3DSparkEvaluator.generate_one_sample -> generate_decoding_sample -> build_dspark_proposal -> verify_draft_tokens -> _post_verify`。新 evaluator 先执行父类已有的 confidence 校准记录，再增加本实验计数。
+调用链为 `run_markov_probability_drop_observation.py -> torch.multiprocessing.spawn -> MarkovProbabilityDropEvaluator -> generate_decoding_sample -> DiagnosticMarkovProposalMixin._propose -> build_diagnostic_markov_proposal -> verify_draft_tokens -> _post_verify`。新 evaluator 先执行父类已有的 confidence 校准记录，再增加本实验计数。
 
-`build_dspark_proposal` 已经为 speculative verify 构造完整的 `proposal.draft_probs`。本实验通过 `proposal.verify_input_ids[:,1:]` 取得各位置实际提交 token，再用 `gather` 得到全部 $P_i=q_i(z_i)$；不重新计算 logits、不增加模型前向，也不消费随机数。前缀均值、两类下降量和 92 组阈值比较均由独立观测器完成。
+隔离 proposal builder 复用本轮已经计算出的 Markov corrected logits：按解码温度构造 operational `proposal.draft_probs` 交给 verifier，同时暂存同一份 corrected logits。观测器对后者执行普通 float32 softmax，再按 `proposal.verify_input_ids[:,1:]` gather 得到全部 $P_i=q_i^{obs}(z_i)$；不重新执行模型前向、不消费额外随机数，也不改变 verify 分布。前缀均值、两类下降量和阈值比较均由独立观测器完成。
 
 92 组阈值计数保留在各 rank 的设备上，数据集结束时才归约；Gloo 会在归约阶段转到 CPU，NCCL 保留在 GPU。每个 rank 同时写自己的 `rank_stats/rank_<rank>.json` 作为审计依据。不同实验使用独立时间戳目录；自动端口探测与前一项观测实验共用租约目录，从而避开已有监听端口和并行启动的观测任务。
 
@@ -134,7 +135,7 @@ set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN
 示例按原复现指南使用物理 GPU 2、3。这里不设置固定 `MASTER_PORT`，由启动器自动选择并租约。
 
 ```bash
-set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_markov_probability_drop_rejection_all && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE -u MASTER_PORT CUDA_VISIBLE_DEVICES=0,1,2,3 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 /data/home/wly/.conda/envs/dspark/bin/python /data/home/wly/dLLM/DeepSpec/observations/markov_probability_drop_rejection/run_markov_probability_drop_observation.py all --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 2048 --temperature 1.0 --confidence-threshold 0.0 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 --master-addr 127.0.0.1 --abs-drop-min 0.05 --abs-drop-max 0.25 --pct-drop-min 0.05 --pct-drop-max 0.30 --drop-step 0.005 2>&1 | tee "$RUN_DIR/eval.log"
+set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_markov_probability_drop_rejection_all && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE -u MASTER_PORT CUDA_VISIBLE_DEVICES=0,1 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 /data/home/wly/.conda/envs/dspark/bin/python /data/home/wly/dLLM/DeepSpec/observations/markov_probability_drop_rejection/run_markov_probability_drop_observation.py all --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 2048 --temperature 0.0 --confidence-threshold 0.0 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 --master-addr 127.0.0.1 --abs-drop-min 0.10 --abs-drop-max 0.65 --pct-drop-min 0.10 --pct-drop-max 0.65 --drop-step 0.005 2>&1 | tee "$RUN_DIR/eval.log"
 ```
 
 ### 8.3 单数据集全量命令
@@ -180,7 +181,7 @@ set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN
 | `--target` | Qwen3-8B 路径 | 本地 target checkpoint。 |
 | `--draft` | DSpark block7 路径 | 本地 Qwen3 DSpark checkpoint，必须启用 Markov 修正；`--confidence-threshold > 0` 时还必须有 confidence head。 |
 | `--max-new-tokens` | `2048` | 每个样本最多生成 token 数；smoke 可改小。 |
-| `--temperature` | `1.0` | target/draft 采样与验证温度，必须大于 0。 |
+| `--temperature` | `1.0` | target/draft 采样与验证温度，必须有限且不小于 0；`0<=temperature<1e-5` 为精确 greedy。该参数不缩放本实验的 diagnostic $q_i^{obs}$。 |
 | `--confidence-threshold` | `0.0` | DSpark proposal early-stop 阈值；与 baseline 及完整七位置观测对齐时保持 0。 |
 | `--seed` | `980406` | 数据子采样及逐样本采样 seed。 |
 | `--step` | `0` | TensorBoard step 和父类 confidence artifact 的 step。 |
@@ -202,6 +203,8 @@ set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN
 ## 10. settings 和结果文件
 
 启动器接受目录后首先以独占方式写 `settings.json`，后续不再修改。它记录公式、包含边界的判断规则、完整 41+51 阈值列表、超参、数据 SHA-256、checkpoint config SHA-256、Git commit/工作树、GPU 映射、自动端口和完整命令。模型加载失败时 settings 仍然保留。
+
+当前温度无关 diagnostic 概率口径使用 schema version 2；此前尚未按该口径生成全量结果。旧 schema version 1 使用 temperature-dependent operational `draft_probs`，不得与 version 2 的阈值计数或比例混合。所有新结果都必须使用新的时间戳目录。
 
 典型目录：
 

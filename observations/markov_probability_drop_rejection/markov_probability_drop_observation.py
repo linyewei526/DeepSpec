@@ -2,9 +2,10 @@
 
 For draft position i >= 1, this experiment compares ``P_i = q_i[z_i]`` with
 the mean selected-token draft probability of positions 0..i-1 from the same
-draft forward pass.  Here q_i is the operational Markov-corrected draft
-distribution and z_i is the submitted token.  The observer never changes
-decoding decisions or random state.
+draft forward pass.  Here ``q_i = softmax(markov_corrected_logits_i)`` without
+temperature scaling and z_i is the submitted token.  This diagnostic
+distribution is separate from the operational distribution used by
+speculative verification.
 """
 
 from __future__ import annotations
@@ -22,12 +23,15 @@ import torch
 import torch.distributed as dist
 
 from deepspec.eval.base_evaluator import VerificationResult
-from deepspec.eval.dspark.draft_ops import DSparkDraftProposal
 from deepspec.eval.dspark.evaluator import Qwen3DSparkEvaluator
 from deepspec.utils import CustomJSONEncoder
+from observations.markov_diagnostic_draft import (
+    DiagnosticMarkovDraftProposal,
+    DiagnosticMarkovProposalMixin,
+)
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ABSOLUTE_FAMILY = "absolute_drop"
 PERCENTAGE_FAMILY = "percentage_drop"
 SCALAR_COUNT_KEYS = (
@@ -167,7 +171,7 @@ class MarkovProbabilityDropMetrics:
     def observe(
         self,
         *,
-        proposal: DSparkDraftProposal,
+        proposal: DiagnosticMarkovDraftProposal,
         verification: VerificationResult,
     ) -> None:
         self.counts["verification_rounds"] += 1
@@ -178,18 +182,25 @@ class MarkovProbabilityDropMetrics:
 
         self.counts["proposal_rounds"] += 1
         self.counts["generated_draft_token_count"] += proposal_length
-        draft_probs = proposal.draft_probs
-        if draft_probs is None:
+        diagnostic_logits = proposal.diagnostic_markov_logits
+        if diagnostic_logits is None:
             raise RuntimeError(
-                "The Markov probability-drop experiment requires full draft_probs"
+                "The Markov probability-drop experiment requires diagnostic Markov logits"
             )
-        if draft_probs.ndim != 3 or draft_probs.size(0) != 1:
+        if diagnostic_logits.ndim != 3 or diagnostic_logits.size(0) != 1:
             raise ValueError(
-                "draft_probs must have shape [1, proposal_length, vocab_size], got "
-                f"{tuple(draft_probs.shape)}"
+                "diagnostic_markov_logits must have shape "
+                "[1, proposal_length, vocab_size], got "
+                f"{tuple(diagnostic_logits.shape)}"
             )
-        if draft_probs.size(1) < proposal_length:
-            raise ValueError("draft_probs is shorter than draft_token_count")
+        if diagnostic_logits.size(1) < proposal_length:
+            raise ValueError(
+                "diagnostic_markov_logits is shorter than draft_token_count"
+            )
+        diagnostic_logits = diagnostic_logits[:, :proposal_length, :].detach().float()
+        if not bool(torch.isfinite(diagnostic_logits).all().item()):
+            raise ValueError("Diagnostic Markov logits must be finite")
+        diagnostic_probabilities = torch.softmax(diagnostic_logits, dim=-1)
         if proposal.verify_input_ids.ndim != 2 or proposal.verify_input_ids.size(0) != 1:
             raise ValueError(
                 "verify_input_ids must have shape [1, proposal_length + 1], got "
@@ -255,9 +266,9 @@ class MarkovProbabilityDropMetrics:
         submitted_token_ids = proposal.verify_input_ids[
             0, 1 : proposal_length + 1
         ].long()
-        selected_probabilities = draft_probs[
+        selected_probabilities = diagnostic_probabilities[
             0, :proposal_length, :
-        ].detach().float().gather(
+        ].gather(
             dim=-1,
             index=submitted_token_ids.unsqueeze(-1),
         ).squeeze(-1)
@@ -426,9 +437,13 @@ class MarkovProbabilityDropMetrics:
             "created_at": _now_iso(),
             "definitions": {
                 "selected_token_markov_draft_probability": (
-                    "P_i = q_i[z_i], where q_i = softmax(markov_corrected_logits_i / "
-                    "temperature) and z_i is the submitted draft token; at "
-                    "temperature 1.0 this is softmax(markov_corrected_logits_i)"
+                    "P_i = q_obs_i[z_i], where q_obs_i = "
+                    "softmax(markov_corrected_logits_i) without temperature scaling "
+                    "and z_i is the submitted draft token"
+                ),
+                "operational_distribution_separation": (
+                    "speculative verification continues to use the temperature-dependent "
+                    "operational proposal.draft_probs; q_obs_i is diagnostic only"
                 ),
                 "semantic_note": (
                     "P_i is draft-model probability mass for the submitted token, "
@@ -763,7 +778,7 @@ class MarkovProbabilityDropRecorder:
     def observe(
         self,
         *,
-        proposal: DSparkDraftProposal,
+        proposal: DiagnosticMarkovDraftProposal,
         verification: VerificationResult,
     ) -> None:
         if self.current is None:
@@ -896,7 +911,10 @@ class MarkovProbabilityDropRecorder:
         print(table.get_string(), flush=True)
 
 
-class MarkovProbabilityDropEvaluator(Qwen3DSparkEvaluator):
+class MarkovProbabilityDropEvaluator(
+    DiagnosticMarkovProposalMixin,
+    Qwen3DSparkEvaluator,
+):
     """Qwen3 DSpark evaluator with isolated Markov probability-drop counters."""
 
     def __init__(self, local_rank: int, args):
@@ -920,8 +938,11 @@ class MarkovProbabilityDropEvaluator(Qwen3DSparkEvaluator):
     def _post_verify(self, proposal, verification) -> None:
         # Preserve the parent recorder and add only deterministic counters.
         super()._post_verify(proposal, verification)
-        if not isinstance(proposal, DSparkDraftProposal):
-            raise TypeError(f"Expected DSparkDraftProposal, got {type(proposal)!r}")
+        if not isinstance(proposal, DiagnosticMarkovDraftProposal):
+            raise TypeError(
+                "Expected DiagnosticMarkovDraftProposal, got "
+                f"{type(proposal)!r}"
+            )
         self.markov_probability_drop_recorder.observe(
             proposal=proposal,
             verification=verification,

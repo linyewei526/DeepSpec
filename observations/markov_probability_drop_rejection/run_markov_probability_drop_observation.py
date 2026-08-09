@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -297,8 +298,8 @@ def main() -> None:
     cli = parse_args()
     if cli.max_new_tokens <= 0:
         raise ValueError("--max-new-tokens must be positive")
-    if cli.temperature <= 0:
-        raise ValueError("--temperature must be positive")
+    if not math.isfinite(cli.temperature) or cli.temperature < 0.0:
+        raise ValueError("--temperature must be finite and non-negative")
     if not 0.0 <= cli.confidence_threshold <= 1.0:
         raise ValueError("--confidence-threshold must be in [0, 1]")
     if cli.max_samples is not None and cli.max_samples <= 0:
@@ -387,7 +388,7 @@ def main() -> None:
     observation_artifact_root = run_dir / "observations" / "markov_probability_drop_rejection"
 
     settings = {
-        "schema_version": 1,
+        "schema_version": 2,
         "experiment": "dspark_qwen3_8b_markov_probability_drop_rejection_prediction",
         "created_at": now_iso(),
         "run_dir": str(run_dir),
@@ -398,13 +399,21 @@ def main() -> None:
                 "position i the first rejected position, or an accepted false positive?"
             ),
             "selected_token_probability": (
-                "P_i = q_i[z_i], where z_i is the submitted draft token and "
-                "q_i = softmax(markov_corrected_logits_i / temperature); at "
-                "temperature 1.0 this is softmax(markov_corrected_logits_i)."
+                "P_i = q_obs_i[z_i], where z_i is the submitted draft token and "
+                "q_obs_i = softmax(markov_corrected_logits_i) without temperature scaling."
             ),
             "semantic_note": (
                 "P_i is draft-model probability mass for the submitted token; "
                 "it is not confidence-head acceptance probability and not cumprod."
+            ),
+            "operational_distribution": (
+                "Sampling and speculative verification continue to use the decoding-temperature "
+                "distribution proposal.draft_probs; at greedy temperature this is one-hot. "
+                "The observation-only q_obs_i never replaces it."
+            ),
+            "trajectory_note": (
+                "The softmax mapping used by q_obs_i is temperature-independent, but changing "
+                "temperature can change sampled prefix tokens and therefore later corrected logits."
             ),
             "prior_mean": "P_i_mean = mean(P_0, ..., P_{i-1}), i >= 1",
             "absolute_drop": "P_i_mean - P_i",
@@ -464,6 +473,7 @@ def main() -> None:
         "hyperparameters": {
             "max_new_tokens": cli.max_new_tokens,
             "temperature": cli.temperature,
+            "temperature_mode": "greedy" if cli.temperature < 1e-5 else "sampling",
             "confidence_threshold": cli.confidence_threshold,
             "seed": cli.seed,
             "step": cli.step,

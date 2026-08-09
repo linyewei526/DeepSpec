@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -218,8 +219,8 @@ def main() -> None:
     cli = parse_args()
     if cli.max_new_tokens <= 0:
         raise ValueError("--max-new-tokens must be positive")
-    if cli.temperature <= 0:
-        raise ValueError("--temperature must be positive")
+    if not math.isfinite(cli.temperature) or cli.temperature < 0.0:
+        raise ValueError("--temperature must be finite and non-negative")
     if not 0.0 <= cli.confidence_threshold <= 1.0:
         raise ValueError("--confidence-threshold must be in [0, 1]")
     if cli.max_samples is not None and cli.max_samples <= 0:
@@ -293,19 +294,27 @@ def main() -> None:
     observation_artifact_root = run_dir / "observations" / "markov_draft_probability"
 
     settings = {
-        "schema_version": 2,
+        "schema_version": 3,
         "experiment": "dspark_qwen3_8b_markov_draft_probability_and_true_draft_rank",
         "created_at": now_iso(),
         "run_dir": str(run_dir),
         "purpose": {
             "selected_token_probability": (
-                "P_k = q_k[z_k], where z_k is the submitted draft token and "
-                "q_k = softmax(markov_corrected_logits_k / temperature); at "
-                "temperature 1.0 this is softmax(markov_corrected_logits_k)."
+                "P_k = q_obs_k[z_k], where z_k is the submitted draft token and "
+                "q_obs_k = softmax(markov_corrected_logits_k) without temperature scaling."
             ),
             "semantic_note": (
                 "P_k is draft-model probability mass for the submitted token; "
                 "it is not confidence-head acceptance probability and not cumprod."
+            ),
+            "operational_distribution": (
+                "Sampling and speculative verification continue to use the decoding-temperature "
+                "distribution proposal.draft_probs; at greedy temperature this is one-hot. "
+                "The observation-only q_obs_k never replaces it."
+            ),
+            "trajectory_note": (
+                "The softmax mapping used by q_obs_k is temperature-independent, but changing "
+                "temperature can change sampled prefix tokens and therefore later corrected logits."
             ),
             "accepted_distribution": (
                 "P_k of every draft position actually accepted by verification."
@@ -328,8 +337,9 @@ def main() -> None:
                 "TensorBoard gap summaries; the exclusion audit count itself is still reported."
             ),
             "true_draft_rank": (
-                "1 + count(q_k[v] > q_k[correction_token]) over the complete "
-                "Markov-corrected q_k; categories 1..10,other."
+                "1 + count(markov_corrected_logits_k[v] > "
+                "markov_corrected_logits_k[correction_token]) over the complete "
+                "temperature-independent diagnostic distribution; categories 1..10,other."
             ),
             "cdf_bin_width": 0.05,
             "gap_cdf_range": [0.0, 1.0],
@@ -359,6 +369,7 @@ def main() -> None:
         "hyperparameters": {
             "max_new_tokens": cli.max_new_tokens,
             "temperature": cli.temperature,
+            "temperature_mode": "greedy" if cli.temperature < 1e-5 else "sampling",
             "confidence_threshold": cli.confidence_threshold,
             "seed": cli.seed,
             "step": cli.step,

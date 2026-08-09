@@ -8,22 +8,22 @@
 
 ## 2. 四项指标的精确定义
 
-令第 $k$ 个 draft 位置经 Markov 头修正后的完整 operational draft 分布为
+令第 $k$ 个 draft 位置经 Markov 头修正后的 logits 为 $\ell_k$。本实验定义温度无关的 diagnostic 分布为
 
 \[
-q_k=\operatorname{softmax}(\operatorname{markov\_corrected\_logits}_k/T),
+q_k^{obs}=\operatorname{softmax}(\ell_k),
 \]
 
 实际提交验证的 draft token 记为 $z_k$，本实验用于分布和差值统计的标量是
 
 \[
-P_k=q_k(z_k).
+P_k=q_k^{obs}(z_k).
 \]
 
-也就是完整 $q_k$ 中实际提交 token 自己的概率。基准参数 `temperature=1.0` 时，$q_k$ 就是 Markov 修正 logits 的普通 softmax；若修改 `--temperature`，记录的是推理和 verify 实际使用的 `softmax(logits / temperature)`。$P_k$ 是 draft 模型给所选 token 的概率质量，不是 confidence head 的接收概率、不是累积概率，也不是理论接受概率 $\min(1,p_k(z_k)/q_k(z_k))$。
+也就是对 Markov 修正 logits 直接做普通 softmax 后，实际提交 token 自己的概率，不执行 `/temperature`。采样与 speculative verification 仍使用另一份 operational 分布 $q_k^{verify}$：`temperature>=1e-5` 时为 $\operatorname{softmax}(\ell_k/T)$，`0<=temperature<1e-5` 时为 greedy argmax 的 one-hot 分布。$q_k^{obs}$ 仅供观测，绝不替换 verifier 的 `proposal.draft_probs`。因此 greedy 时实际提交 token 的 $P_k$ 通常小于 1，仍能反映 Markov logits 的概率强弱。这里的“温度无关”指从当前 $\ell_k$ 到 $q_k^{obs}$ 的映射不除以温度；不同温度可能改变已采样 prefix，进而间接改变后续位置的 $\ell_k$。
 
 1. `accepted_selected_draft_probability`：所有验证轮中，逐个记录实际通过验证位置的 $P_k$。报告总数、均值、最小值、最大值，以及宽度为 0.05 的 PMF/CDF。区间固定为 `[0.00,0.05)` 到 `[0.95,1.00]`。
-2. `rejected_selected_draft_probability`：仅记录每轮第一个验证失败、随后由 `verification.next_token` 替换的位置上错误 draft token 的 $P_k=q_k(z_k)$。这里不是 correction token 的概率。后续未独立验证的位置不纳入，空 proposal 也不伪装成拒绝事件。
+2. `rejected_selected_draft_probability`：仅记录每轮第一个验证失败、随后由 `verification.next_token` 替换的位置上错误 draft token 的 $P_k=q_k^{obs}(z_k)$。这里不是 correction token 的概率。后续未独立验证的位置不纳入，空 proposal 也不伪装成拒绝事件。
 3. 同轮有至少一个已通过 draft token 时，令 `accepted_mean` 为本轮这些通过位置的 $P_k$ 均值：
    - `signed_absolute_gap = accepted_mean - rejected_probability`；
    - `signed_relative_gap = signed_absolute_gap / accepted_mean`；
@@ -37,15 +37,15 @@ P_k=q_k(z_k).
    ```
 
    过滤后的 absolute gap 和 relative gap 都位于 `[0,1]`，固定按 0.05 分为 `[0.00,0.05)` 至 `[0.95,1.00]`。若第一个位置就失败，本轮计入 `first_position_correction_events`，但不是 gap candidate。若一个已纳入事件的 `accepted_mean` 数值为零，会计入 `undefined_relative_gap_events`：absolute gap 仍有效，relative gap 不记录。这里报告的是以 `signed_absolute_gap >= 0` 为条件的 gap 分布，不再表示全部 correction events 的无条件分布。
-4. `true_draft_rank`：在失败位置完整的、Markov 头修正后的 draft logits softmax 分布 $q_k$ 上，计算实际 correction token 的真实 competition rank：
+4. `true_draft_rank`：在失败位置完整的温度无关 diagnostic 分布 $q_k^{obs}$ 上，计算实际 correction token 的真实 competition rank。代码直接比较对应的 Markov 修正 logits，利用 softmax 的严格单调性避免极小概率下溢造成伪并列：
 
 \[
-\operatorname{rank}=1+\#\{v:q_k(v)>q_k(\text{correction token})\}.
+\operatorname{rank}=1+\#\{v:\ell_k(v)>\ell_k(\text{correction token})\}.
 \]
 
-   排名使用完整词表，不使用 top-k 近似；并列概率共享同一名次。输出类别为 `1,2,...,10,other`，每类给出 count 和占全部 correction events 的 probability，同时附该类 correction token 的 $q_k$ 概率均值、最小值和最大值。这一项与前一组条件置信度实验定义相同，因为原实验的 `true_draft_rank` 本来就使用完整 $q_k$。
+   排名使用完整词表，不使用 top-k 近似；相同 logits 共享同一名次。输出类别为 `1,2,...,10,other`，每类给出 count 和占全部 correction events 的 probability，同时附该类 correction token 的 $q_k^{obs}$ 概率均值、最小值和最大值。greedy 下排名不会因 verifier 的 one-hot operational 分布而退化。
 
-DSpark 当前验证实现中的 correction token 是从归一化正残差分布 `[p_k-q_k]_+` 采样并实际提交的 `verification.next_token`，这里的“被替换上的 token”严格指它，而不是 target 分布的 argmax。
+DSpark 当前验证实现中的 correction token 是从 operational 分布构造的归一化正残差 `[p_k^{verify}-q_k^{verify}]_+` 采样并实际提交的 `verification.next_token`；greedy 时该 token 就是 target argmax。这里的“被替换上的 token”严格指 `verification.next_token`。
 
 ## 3. 代码隔离与调用链
 
@@ -55,10 +55,11 @@ DSpark 当前验证实现中的 correction token 是从归一化正残差分布 
 - `observations/markov_draft_probability/markov_probability_observation.py`：观测累加器、跨 rank 合并、CDF/rank 产物和隔离 evaluator；
 - `observations/markov_draft_probability/run_markov_probability_observation.py`：时间戳目录校验、不可变 settings、自动端口租约、manifest 和多 GPU 启动；
 - `observations/markov_draft_probability/summarize_markov_probability_observation.py`：只读汇总工具。
+- `observations/markov_diagnostic_draft.py`：两组 Markov 观测共用的隔离 proposal mixin；同时保留 verifier 的 operational `draft_probs` 和只供观测的 corrected logits。
 
-调用链为 `run_markov_probability_observation.py -> torch.multiprocessing.spawn -> MarkovDraftProbabilityEvaluator -> Qwen3DSparkEvaluator.generate_one_sample -> generate_decoding_sample -> build_dspark_proposal -> verify_draft_tokens -> _post_verify`。新 evaluator 先保留父类原有 confidence 校准记录，再执行本实验的只读观测。
+调用链为 `run_markov_probability_observation.py -> torch.multiprocessing.spawn -> MarkovDraftProbabilityEvaluator -> generate_decoding_sample -> DiagnosticMarkovProposalMixin._propose -> build_diagnostic_markov_proposal -> verify_draft_tokens -> _post_verify`。新 evaluator 先保留父类原有 confidence 校准记录，再执行本实验的只读观测。
 
-`build_dspark_proposal` 已经为 speculative verify 构造完整的 `proposal.draft_probs`。观测器使用 `proposal.verify_input_ids[:,1:]` 取得实际提交 token，并在每个位置对 `draft_probs` 执行 `gather` 得到 $q_k(z_k)$；不重新计算 logits、不增加模型前向，也不改变 verify 使用的分布。
+隔离 proposal builder 复用本轮已经计算出的 Markov corrected logits：按解码温度构造 operational `proposal.draft_probs` 交给 verifier，同时把同一份 corrected logits 暂存到 `diagnostic_markov_logits`。观测器对后者执行普通 float32 softmax，再按 `proposal.verify_input_ids[:,1:]` gather 得到 $q_k^{obs}(z_k)$；不重新执行模型前向、不消费额外随机数，也不改变 verify 使用的分布。
 
 每个 rank 只写本轮结果目录下自己的 `rank_stats/rank_<rank>.json`；barrier 后由 rank 0 合并，因此不同实验只要使用不同时间戳目录就不会互相覆盖。启动器省略 `--master-port` 时会探测空闲本地端口，并在所有观测实验共享的 `/tmp/deepspec_conditional_confidence_ports/` 建立运行期端口租约；已有监听端口及并行启动的观测实验租约都会避开。若手工传入 `--master-port`，已占用或已租约的端口会直接报错。
 
@@ -91,7 +92,7 @@ set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN
 该命令按原指南第 8.2 节使用物理 GPU 2、3；可按实际显存情况修改可见卡列表。这里故意不设置固定 `MASTER_PORT`，由启动器自动分配。
 
 ```bash
-set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_markov_draft_probability_all && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE -u MASTER_PORT CUDA_VISIBLE_DEVICES=0,1,2,3 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 /data/home/wly/.conda/envs/dspark/bin/python /data/home/wly/dLLM/DeepSpec/observations/markov_draft_probability/run_markov_probability_observation.py all --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 2048 --temperature 1.0 --confidence-threshold 0.0 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 --master-addr 127.0.0.1 2>&1 | tee "$RUN_DIR/eval.log"
+set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_markov_draft_probability_all && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE -u MASTER_PORT CUDA_VISIBLE_DEVICES=0,1,2,3 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 /data/home/wly/.conda/envs/dspark/bin/python /data/home/wly/dLLM/DeepSpec/observations/markov_draft_probability/run_markov_probability_observation.py all --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 2048 --temperature 0.0 --confidence-threshold 0.0 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 --master-addr 127.0.0.1 2>&1 | tee "$RUN_DIR/eval.log"
 ```
 
 ### 5.3 单数据集全量命令
@@ -129,7 +130,7 @@ set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN
 | `--target` | Qwen3-8B 本地路径 | target checkpoint。启动前验证本地目录和 `config.json`，不会联网下载。 |
 | `--draft` | block7 本地路径 | DSpark draft checkpoint；必须是 `Qwen3DSparkModel` 且启用 Markov 修正。`--confidence-threshold > 0` 时还必须有 confidence head。 |
 | `--max-new-tokens` | `2048` | 每个样本最多生成 token 数。smoke 可临时设为 `64`。 |
-| `--temperature` | `1.0` | target/draft 采样及验证使用的温度；必须大于 0。 |
+| `--temperature` | `1.0` | target/draft 采样及验证温度，必须有限且不小于 0；`0<=temperature<1e-5` 为精确 greedy。该参数不缩放本实验的 diagnostic $q_k^{obs}$。 |
 | `--confidence-threshold` | `0.0` | draft confidence early-stop 阈值，范围 `[0,1]`。为与 baseline 和全 block 观测一致，全量实验保持 `0.0`。 |
 | `--seed` | `980406` | 数据子采样与逐样本随机采样 seed。 |
 | `--step` | `0` | TensorBoard step 和原有 confidence artifact 的 step 目录。 |
@@ -168,15 +169,15 @@ YYYYMMDD_HHMMSS_markov_draft_probability_all/
 - `experiment_manifest.json`：可变运行状态；每完成一个数据集立即更新，失败时保留错误堆栈。
 - `dataset_results.jsonl`：每完成一个数据集 `flush+fsync` 追加一行，包含 baseline speculative metrics、原有累计 confidence 摘要和本实验摘要。
 - `metrics.json`：该数据集的完整定义、计数、均值、0.05 分箱、PMF、CDF 和 rank 分布，是权威聚合结果。
-- `markov_draft_probability_cdf.csv`：通过位置提交 token 与失败位置错误 draft token 的 $q_k(z_k)$ 分布。
+- `markov_draft_probability_cdf.csv`：通过位置提交 token 与失败位置错误 draft token 的 $q_k^{obs}(z_k)$ 分布。
 - `signed_gap_cdf.csv`：过滤掉 `signed_absolute_gap < 0` 事件后，非负 absolute gap 和 relative gap 在 `[0,1]` 上的分布。
-- `true_draft_rank.csv`：`1..10,other` 的 count/probability，以及各类 correction token 的 draft $q_k$ 概率统计。
+- `true_draft_rank.csv`：`1..10,other` 的 count/probability，以及各类 correction token 的 diagnostic $q_k^{obs}$ 概率统计。
 - `rank_stats/`：每个 rank 的充分统计量，便于审计跨卡合并；不是逐 token 原始日志。
 - `tensorboard/`：保留原复现的 speculative/confidence 指标，并增加 `markov_draft_probability/<dataset>/...` 标量。
 
 CDF CSV 中 `probability` 是当前 0.05 区间占全部已纳入该 gap 分布事件的比例，`cdf` 是截至该区间上沿的累计比例。对 relative gap，数值 `0.25` 表示失败位置错误 draft token 的 $P_k$ 比同轮通过位置均值低 25%。负 relative gap 不会出现，因为对应事件已由 `signed_absolute_gap < 0` 条件排除；排除规模应查看 `metrics.json`、`dataset_results.jsonl` 或终端汇总中的 `negative_gap_excluded_events`。
 
-本修改后的观测产物使用 schema version 2。目录 `20260807_173321_markov_draft_probability_all` 是修改前 schema version 1 运行，保留带符号负 gap，不能与新语义下的 gap 均值/CDF 直接混合比较，也不会被原地改写；要获得新口径结果，必须按本指南重新建立新的时间戳目录运行。新运行的 settings 会在模型加载前写明过滤定义和 `[0,1]` 的 gap CDF 范围。
+当前温度无关 diagnostic 概率口径使用 schema version 3。目录 `20260807_173321_markov_draft_probability_all` 是 schema version 1；`20260807_180318_markov_draft_probability_all` 是 schema version 2，虽已采用非负 gap 过滤，但仍观测 temperature-dependent operational `draft_probs`。两者都不会被原地改写，也不能与 schema version 3 的概率、gap 或 rank 混合；新口径必须建立新的时间戳目录运行。schema version 3 settings 会同时写明 diagnostic/operational 分布分离和 `[0,1]` gap CDF 范围。
 
 ## 8. 运行监控与完整性检查
 
