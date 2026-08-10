@@ -79,7 +79,7 @@ absolute 和 percentage 的每个阈值都输出：
 
 除阈值结果外，还输出 verification rounds、proposal rounds、生成/接受 token 总数、可判定 accepted/rejected 分母、位置 0 排除数、首位置拒绝数、首拒绝后忽略数和 accepted EOS 后忽略数，便于审计分母。
 
-为便于人工查阅，实验根目录同时维护 `confidence_drop_results.md`。文件在启动时写入说明头；每完成一个数据集，rank 0 在其中追加一个 dataset 章节和两张完整表：`token_x_drop_abs` 表包含全部 absolute 阈值，`token_y_drop_pct` 表包含全部 percentage 阈值。比例字段在 Markdown 中显示为百分数，原始小数仍保留在 JSON/CSV 中。追加操作会执行 `flush+fsync`，因此不必等待九项全部结束即可查看已经完成的数据集。
+为便于人工查阅，实验根目录同时维护 `confidence_drop_results.md`。文件在启动时写入说明头；每完成一个数据集，rank 0 写入一个 dataset 章节和两张完整表，并刷新文件末尾两张跨数据集宏平均表。`token_x_drop_abs` 表包含全部 absolute 阈值，`token_y_drop_pct` 表包含全部 percentage 阈值。比例字段在 Markdown 中显示为百分数，原始小数仍保留在 JSON/CSV 中。更新采用原子替换，因此不必等待九项全部结束即可查看已经完成的数据集。
 
 ## 6. 代码隔离和调用链
 
@@ -88,7 +88,7 @@ absolute 和 percentage 的每个阈值都输出：
 - `observations/confidence_drop_rejection/__init__.py`：实验包入口；
 - `observations/confidence_drop_rejection/confidence_drop_observation.py`：同轮前缀均值、GPU 阈值计数、标签映射、跨 rank 归约和结果产物；
 - `observations/confidence_drop_rejection/run_confidence_drop_observation.py`：本地 checkpoint/data 校验、时间戳目录、不可变 settings、自动端口租约、manifest 和多 GPU 启动；
-- `observations/confidence_drop_rejection/summarize_confidence_drop_observation.py`：只读汇总和阈值筛选。
+- `observations/confidence_drop_rejection/summarize_confidence_drop_observation.py`：终端汇总和阈值筛选；显式传参时可幂等回填旧目录的 Markdown 宏平均表。
 
 调用链为 `run_confidence_drop_observation.py -> torch.multiprocessing.spawn -> ConfidenceDropEvaluator -> Qwen3DSparkEvaluator.generate_one_sample -> generate_decoding_sample -> build_dspark_proposal -> verify_draft_tokens -> _post_verify`。新 evaluator 先执行父类已有的 confidence 校准记录，再增加本实验计数。
 
@@ -126,7 +126,7 @@ set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN
 示例按原复现指南使用物理 GPU 2、3。这里不设置固定 `MASTER_PORT`，由启动器自动选择并租约。
 
 ```bash
-set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_confidence_drop_rejection_all && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE -u MASTER_PORT CUDA_VISIBLE_DEVICES=0,1,2,3 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 /data/home/wly/.conda/envs/dspark/bin/python /data/home/wly/dLLM/DeepSpec/observations/confidence_drop_rejection/run_confidence_drop_observation.py all --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 2048 --temperature 1.0 --confidence-threshold 0.0 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 --master-addr 127.0.0.1 --abs-drop-min 0.05 --abs-drop-max 0.25 --pct-drop-min 0.05 --pct-drop-max 0.30 --drop-step 0.005 2>&1 | tee "$RUN_DIR/eval.log"
+set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_confidence_drop_rejection_all && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE -u MASTER_PORT CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 /data/home/wly/.conda/envs/dspark/bin/python /data/home/wly/dLLM/DeepSpec/observations/confidence_drop_rejection/run_confidence_drop_observation.py all --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 2048 --temperature 1.0 --confidence-threshold 0.0 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 --master-addr 127.0.0.1 --abs-drop-min 0.05 --abs-drop-max 0.25 --pct-drop-min 0.05 --pct-drop-max 0.30 --drop-step 0.005 2>&1 | tee "$RUN_DIR/eval.log"
 ```
 
 ### 8.3 单数据集全量命令
@@ -137,7 +137,7 @@ set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN
 set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_confidence_drop_rejection_gsm8k && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE -u MASTER_PORT CUDA_VISIBLE_DEVICES=2,3 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 /data/home/wly/.conda/envs/dspark/bin/python /data/home/wly/dLLM/DeepSpec/observations/confidence_drop_rejection/run_confidence_drop_observation.py gsm8k --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 2048 --temperature 1.0 --confidence-threshold 0.0 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 --master-addr 127.0.0.1 --abs-drop-min 0.05 --abs-drop-max 0.25 --pct-drop-min 0.05 --pct-drop-max 0.30 --drop-step 0.005 2>&1 | tee "$RUN_DIR/eval.log"
 ```
 
-### 8.4 只读汇总
+### 8.4 汇总与可选 Markdown 回填
 
 只看各数据集分母和删失计数：
 
@@ -247,7 +247,7 @@ tail -f /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/<时间戳目录>/eval.log
 随数据集完成实时查看 Markdown 汇总：
 
 ```bash
-tail -f /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/<时间戳目录>/confidence_drop_results.md
+tail -F /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/<时间戳目录>/confidence_drop_results.md
 ```
 
 检查九项状态：
@@ -256,7 +256,7 @@ tail -f /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/<时间戳目录>/confiden
 /data/home/wly/.conda/envs/dspark/bin/python -c 'import json,sys; p=json.load(open(sys.argv[1])); print(p["status"],p["completed_dataset_count"],[(d["name"],d["status"]) for d in p["datasets"]])' /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/<时间戳目录>/experiment_manifest.json
 ```
 
-完整全量实验应满足：manifest 为 `completed`、`completed_dataset_count=9`、九个数据集全部 completed；`confidence_drop_results.md` 中有九个 dataset 章节和十八张阈值表；每个数据集都有 `metrics.json`、两个阈值 CSV、曲线图和所有可见 rank 的审计文件；settings 中 threshold count 必须分别为 41 和 51。不能把首位置拒绝计入可判定 recall 分母，也不能把首拒绝之后的 draft positions 当作标签样本。
+完整全量实验应满足：manifest 为 `completed`、`completed_dataset_count=9`、九个数据集全部 completed；`confidence_drop_results.md` 中有九个 dataset 章节、十八张逐数据集阈值表和末尾两张宏平均表；每个数据集都有 `metrics.json`、两个阈值 CSV、曲线图和所有可见 rank 的审计文件；settings 中 threshold count 必须分别为 41 和 51。不能把首位置拒绝计入可判定 recall 分母，也不能把首拒绝之后的 draft positions 当作标签样本。
 
 ## 12. `confidence_drop_results.md` 表格字段解读
 
@@ -314,3 +314,17 @@ tail -f /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/<时间戳目录>/confiden
 - draft 序列的第 0 个 token 没有更早 token 可用于计算 `C_i_mean`，不进入上述阈值统计；若首个拒绝恰好发生在第 0 个位置，会单独计入 `unscorable_first_position_rejections`。
 - 本轮首个拒绝位置之后的 draft token 无法判断其本来会被接收还是拒绝，属于删失位置，不会增加 `accepted_count` 或 `rejected_count`；已接收 EOS 之后的位置同样忽略。
 - Markdown 文件把比例渲染为百分数便于阅读；对应 JSON/CSV 中通常保留 `[0, 1]` 范围内的小数值。例如 Markdown 的 `40.0000%` 在结构化结果中对应 `0.4`。
+
+## 13. 跨数据集宏平均与旧结果回填
+
+文件末尾的 `All-dataset macro average` 含两张表，分别对应 `token_x_drop_abs` 和 `token_y_drop_pct`。对固定阈值和固定列，先在每个数据集内部得到该列的值，再把各数据集值相加并除以数据集数量；这是每个数据集等权的算术平均，不是把所有数据集 token 合并后计算的微平均，因此样本或 token 更多的数据集不会占更大权重。count 列也按数据集求平均，所以可以是小数。
+
+比例列如果某数据集出现 0/0，则该值是未定义而不是 0，宏平均只对有定义的数据集求均值。表内的 `(m/n)` 表示该比例有 `m` 个数据集参与平均、当前文档共含 `n` 个数据集；全部未定义时显示 `N/A (0/n)`。新实验每完成一个数据集都会重建末尾宏平均块，因此中途看到的是“截至当前已完成数据集”的宏平均，九项完成后才是最终九数据集平均。
+
+对已有且不在运行中的结果目录，可直接利用 `dataset_results.jsonl` 中已保存的逐数据集逐阈值结果幂等补写或刷新两张宏平均表；不会重算模型、不会修改 JSON/CSV（单行命令）：
+
+```bash
+cd /data/home/wly/dLLM/DeepSpec && PYTHONPATH=/data/home/wly/dLLM/DeepSpec /data/home/wly/.conda/envs/dspark/bin/python /data/home/wly/dLLM/DeepSpec/observations/confidence_drop_rejection/summarize_confidence_drop_observation.py /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/<时间戳目录> --refresh-markdown-macro
+```
+
+汇总器会拒绝改写 manifest 仍为 `running` 的目录，以免与 rank 0 同时更新 Markdown。重复执行上面命令只替换文件末尾带标记的宏平均块，不会重复追加 dataset 章节。

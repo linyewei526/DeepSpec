@@ -25,9 +25,15 @@ from deepspec.eval.base_evaluator import VerificationResult
 from deepspec.eval.dspark.draft_ops import DSparkDraftProposal
 from deepspec.eval.dspark.evaluator import Qwen3DSparkEvaluator
 from deepspec.utils import CustomJSONEncoder
+from observations.rejection_prediction_summary import (
+    append_dataset_and_refresh_macro,
+    build_direct_dataset_section,
+    build_prediction_threshold_rows,
+    validate_score_thresholds,
+)
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 BIN_WIDTH = 0.05
 CONFIDENCE_MIN_BIN = 0
 CONFIDENCE_MAX_BIN = 19
@@ -230,9 +236,17 @@ class DatasetObservation:
         "first_position_correction_events",
         "paired_gap_events",
         "undefined_relative_gap_events",
+        "ignored_after_first_rejection_token_count",
+        "ignored_after_accepted_eos_token_count",
     )
 
-    def __init__(self) -> None:
+    def __init__(self, score_thresholds: Iterable[str | float]) -> None:
+        thresholds, labels = validate_score_thresholds(score_thresholds)
+        self.score_thresholds = thresholds
+        self.score_threshold_labels = labels
+        self.score_threshold_tensor = torch.tensor(thresholds, dtype=torch.float32)
+        self.accepted_below_threshold_counts = [0] * len(thresholds)
+        self.rejected_below_threshold_counts = [0] * len(thresholds)
         self.counts = Counter({key: 0 for key in self.COUNT_KEYS})
         self.accepted_confidence = HistogramAccumulator()
         self.rejected_confidence = HistogramAccumulator()
@@ -260,9 +274,15 @@ class DatasetObservation:
             raise ValueError("confidence_logits is shorter than draft_token_count")
 
         accepted_count = int(verification.accepted_draft_tokens)
+        effective_length = int(verification.effective_proposal_length)
         if accepted_count < 0 or accepted_count > proposal_length:
             raise ValueError(
                 f"accepted_draft_tokens={accepted_count} is incompatible with proposal_length={proposal_length}"
+            )
+        if effective_length < 0 or effective_length > proposal_length:
+            raise ValueError(
+                f"effective_proposal_length={effective_length} is incompatible with "
+                f"proposal_length={proposal_length}"
             )
         conditional_confidences = torch.sigmoid(
             confidence_logits[0, :proposal_length].detach().float()
@@ -270,11 +290,34 @@ class DatasetObservation:
         accepted_values = [float(value) for value in conditional_confidences[:accepted_count].tolist()]
         for value in accepted_values:
             self.accepted_confidence.add(value, fixed_min=0.0, fixed_max=1.0)
+        if accepted_count:
+            accepted_hits = (
+                conditional_confidences[:accepted_count, None]
+                < self.score_threshold_tensor[None, :]
+            ).sum(dim=0)
+            self.accepted_below_threshold_counts = [
+                count + int(hit)
+                for count, hit in zip(
+                    self.accepted_below_threshold_counts,
+                    accepted_hits.tolist(),
+                    strict=True,
+                )
+            ]
 
         if verification.terminated_by_stop_token:
+            if effective_length != accepted_count:
+                raise ValueError(
+                    "An accepted-EOS round must have effective_proposal_length "
+                    "equal to accepted_draft_tokens"
+                )
             self.counts["accepted_eos_rounds"] += 1
+            self.counts["ignored_after_accepted_eos_token_count"] += (
+                proposal_length - effective_length
+            )
             return
         if accepted_count >= proposal_length:
+            if accepted_count != proposal_length:
+                raise ValueError("A fully accepted round must accept the full proposal")
             self.counts["fully_accepted_proposal_rounds"] += 1
             return
 
@@ -283,6 +326,20 @@ class DatasetObservation:
         self.counts["correction_events"] += 1
         rejected_value = float(conditional_confidences[accepted_count].item())
         self.rejected_confidence.add(rejected_value, fixed_min=0.0, fixed_max=1.0)
+        rejected_hits = (
+            conditional_confidences[accepted_count] < self.score_threshold_tensor
+        ).tolist()
+        self.rejected_below_threshold_counts = [
+            count + int(hit)
+            for count, hit in zip(
+                self.rejected_below_threshold_counts,
+                rejected_hits,
+                strict=True,
+            )
+        ]
+        self.counts["ignored_after_first_rejection_token_count"] += (
+            proposal_length - accepted_count - 1
+        )
 
         if accepted_count == 0:
             self.counts["first_position_correction_events"] += 1
@@ -315,7 +372,25 @@ class DatasetObservation:
         self.true_draft_rank[category].add(correction_probability)
 
     def merge(self, other: "DatasetObservation") -> None:
+        if self.score_threshold_labels != other.score_threshold_labels:
+            raise ValueError("Cannot merge different direct rejection-prediction thresholds")
         self.counts.update(other.counts)
+        self.accepted_below_threshold_counts = [
+            left + right
+            for left, right in zip(
+                self.accepted_below_threshold_counts,
+                other.accepted_below_threshold_counts,
+                strict=True,
+            )
+        ]
+        self.rejected_below_threshold_counts = [
+            left + right
+            for left, right in zip(
+                self.rejected_below_threshold_counts,
+                other.rejected_below_threshold_counts,
+                strict=True,
+            )
+        ]
         self.accepted_confidence.merge(other.accepted_confidence)
         self.rejected_confidence.merge(other.rejected_confidence)
         self.signed_gap.merge(other.signed_gap)
@@ -336,11 +411,23 @@ class DatasetObservation:
                 category: self.true_draft_rank[category].to_payload()
                 for category in RANK_CATEGORIES
             },
+            "direct_rejection_prediction": {
+                "comparison": "conditional_confidence < threshold (strict)",
+                "thresholds": list(self.score_threshold_labels),
+                "accepted_counts": self.accepted_below_threshold_counts,
+                "rejected_counts": self.rejected_below_threshold_counts,
+            },
         }
 
     @classmethod
     def from_payload(cls, payload: dict) -> "DatasetObservation":
-        observation = cls()
+        prediction = payload.get("direct_rejection_prediction")
+        if not isinstance(prediction, dict) or not prediction.get("thresholds"):
+            raise ValueError(
+                "Observation payload has no exact direct rejection-prediction counts; "
+                "schema-v1 results must be rerun for width-0.02 thresholds"
+            )
+        observation = cls(prediction["thresholds"])
         observation.counts = Counter(
             {key: int(payload.get("counts", {}).get(key, 0)) for key in cls.COUNT_KEYS}
         )
@@ -362,6 +449,19 @@ class DatasetObservation:
             category: RankAccumulator.from_payload(rank_payload.get(category, {}))
             for category in RANK_CATEGORIES
         }
+        observation.accepted_below_threshold_counts = [
+            int(value) for value in prediction.get("accepted_counts", [])
+        ]
+        observation.rejected_below_threshold_counts = [
+            int(value) for value in prediction.get("rejected_counts", [])
+        ]
+        if (
+            len(observation.accepted_below_threshold_counts)
+            != len(observation.score_thresholds)
+            or len(observation.rejected_below_threshold_counts)
+            != len(observation.score_thresholds)
+        ):
+            raise ValueError("Malformed direct rejection-prediction threshold counts")
         return observation
 
     def build_report(self, *, dataset_name: str, sample_count: int) -> dict:
@@ -400,6 +500,18 @@ class DatasetObservation:
                 }
             )
 
+        eligible_accepted = self.accepted_confidence.count
+        eligible_rejected = self.rejected_confidence.count
+        direct_rows = build_prediction_threshold_rows(
+            thresholds=self.score_thresholds,
+            threshold_labels=self.score_threshold_labels,
+            accepted_counts=self.accepted_below_threshold_counts,
+            rejected_counts=self.rejected_below_threshold_counts,
+            eligible_accepted=eligible_accepted,
+            eligible_rejected=eligible_rejected,
+            monotonic="nondecreasing",
+        )
+
         return {
             "schema_version": SCHEMA_VERSION,
             "dataset": dataset_name,
@@ -422,6 +534,14 @@ class DatasetObservation:
                     "Markov-corrected draft distribution; competition ranking for ties"
                 ),
                 "cdf": "cumulative probability through each width-0.05 histogram interval",
+                "direct_rejection_prediction": (
+                    "flag an evaluable token iff its raw conditional confidence is "
+                    "strictly below the configured threshold; position 0 is included"
+                ),
+                "direct_prediction_censoring": (
+                    "positions after the first rejection and draft positions discarded "
+                    "after an accepted EOS are excluded"
+                ),
             },
             "counts": {key: int(self.counts[key]) for key in self.COUNT_KEYS},
             "distributions": {
@@ -434,13 +554,31 @@ class DatasetObservation:
                 "denominator": correction_events,
                 "categories": rank_rows,
             },
+            "direct_rejection_prediction": {
+                "comparison": "conditional_confidence < threshold (strict)",
+                "counts": {
+                    "verification_rounds": int(self.counts["verification_rounds"]),
+                    "eligible_accepted_token_count": eligible_accepted,
+                    "eligible_rejected_token_count": eligible_rejected,
+                    "ignored_after_first_rejection_token_count": int(
+                        self.counts["ignored_after_first_rejection_token_count"]
+                    ),
+                    "ignored_after_accepted_eos_token_count": int(
+                        self.counts["ignored_after_accepted_eos_token_count"]
+                    ),
+                },
+                "thresholds": direct_rows,
+            },
         }
 
 
 def merge_observation_payloads(payloads: Iterable[dict]) -> DatasetObservation:
-    merged = DatasetObservation()
-    for payload in payloads:
-        merged.merge(DatasetObservation.from_payload(payload))
+    observations = [DatasetObservation.from_payload(payload) for payload in payloads]
+    if not observations:
+        raise ValueError("No rank observation payloads were provided")
+    merged = observations[0]
+    for observation in observations[1:]:
+        merged.merge(observation)
     return merged
 
 
@@ -463,6 +601,10 @@ def summarize_observation_report(report: dict) -> dict:
         "signed_relative_gap_mean": distributions["signed_relative_gap"]["mean"],
         "signed_relative_gap_mean_percent": distributions["signed_relative_gap"]["mean_percent"],
         "true_draft_rank_probabilities": rank_probabilities,
+        "direct_rejection_prediction": {
+            "sample_count": report["sample_count"],
+            **report["direct_rejection_prediction"],
+        },
     }
 
 
@@ -501,6 +643,25 @@ def _write_rank_csv(path: Path, rank_report: dict) -> None:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rank_report["categories"])
+
+
+def _write_prediction_csv(path: Path, rows: list[dict]) -> None:
+    fieldnames = (
+        "threshold",
+        "threshold_label",
+        "accepted_count",
+        "rejected_count",
+        "flagged_evaluable_count",
+        "accepted_share_among_flagged",
+        "rejected_share_among_flagged",
+        "accepted_flag_rate",
+        "rejected_capture_rate",
+        "flag_rate_among_evaluable",
+    )
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _plot_report(dataset_dir: Path, report: dict) -> Path:
@@ -550,7 +711,16 @@ def _plot_report(dataset_dir: Path, report: dict) -> Path:
 
 
 class ConditionalConfidenceRecorder:
-    def __init__(self, *, artifact_root: Path, tensorboard_dir: str | None, step: int | None):
+    def __init__(
+        self,
+        *,
+        score_thresholds: Iterable[str | float],
+        artifact_root: Path,
+        tensorboard_dir: str | None,
+        step: int | None,
+    ):
+        self.score_thresholds = tuple(score_thresholds)
+        validate_score_thresholds(self.score_thresholds)
         self.artifact_root = Path(artifact_root)
         self.tensorboard_dir = tensorboard_dir
         self.step = step
@@ -560,7 +730,7 @@ class ConditionalConfidenceRecorder:
     def start(self) -> None:
         if self.current is not None:
             raise RuntimeError("Previous dataset observation was not finished")
-        self.current = DatasetObservation()
+        self.current = DatasetObservation(self.score_thresholds)
 
     def observe(self, *, proposal: DSparkDraftProposal, verification: VerificationResult) -> None:
         if self.current is None:
@@ -622,6 +792,10 @@ class ConditionalConfidenceRecorder:
                 ),
             )
             _write_rank_csv(dataset_dir / "true_draft_rank.csv", report["true_draft_rank"])
+            _write_prediction_csv(
+                dataset_dir / "rejection_prediction_thresholds.csv",
+                report["direct_rejection_prediction"]["thresholds"],
+            )
             _plot_report(dataset_dir, report)
             summary = output_payload["observation_summary"]
             self.rows.append({"dataset": dataset_name, **summary})
@@ -709,11 +883,13 @@ class ConditionalConfidenceEvaluator(Qwen3DSparkEvaluator):
         if self.draft_model.confidence_head is None:
             raise RuntimeError("Draft checkpoint has no confidence head")
         self.conditional_confidence_recorder = ConditionalConfidenceRecorder(
+            score_thresholds=args.score_thresholds,
             artifact_root=Path(args.observation_artifact_root),
             tensorboard_dir=args.tensorboard_dir,
             step=args.step,
         )
         self.observation_summaries: dict[str, dict] = {}
+        self.rejection_prediction_summaries: dict[str, dict] = {}
 
     def mark_dataset_started(self, dataset_name: str) -> None:
         super().mark_dataset_started(dataset_name)
@@ -740,6 +916,9 @@ class ConditionalConfidenceEvaluator(Qwen3DSparkEvaluator):
         )
         if summary is not None:
             self.observation_summaries[dataset_name] = summary
+            self.rejection_prediction_summaries[dataset_name] = summary[
+                "direct_rejection_prediction"
+            ]
         return super().record_dataset_metrics(
             dataset_name=dataset_name,
             metric_summary=metric_summary,
@@ -762,6 +941,30 @@ class ConditionalConfidenceEvaluator(Qwen3DSparkEvaluator):
             "confidence_summary": confidence_summary,
             "conditional_confidence_observation_summary": self.observation_summaries.get(dataset_name),
         }
+        markdown_value = getattr(self.args, "markdown_results_path", None)
+        markdown_summary = self.rejection_prediction_summaries.get(dataset_name)
+        if markdown_value is not None and markdown_summary is not None:
+            markdown_path = Path(markdown_value)
+            section = build_direct_dataset_section(
+                dataset_name=dataset_name,
+                completed_at=completed_at,
+                summary=markdown_summary,
+                table_title="conditional_confidence < threshold",
+            )
+            append_dataset_and_refresh_macro(
+                path=markdown_path,
+                dataset_section=section,
+                summaries=self.rejection_prediction_summaries,
+                family_specs=((
+                    "conditional_confidence < threshold",
+                    "threshold",
+                    "thresholds",
+                ),),
+            )
+            print(
+                f"Appended rejection-prediction Markdown and refreshed macro averages in {markdown_path}",
+                flush=True,
+            )
         results_value = getattr(self.args, "dataset_results_path", None)
         if results_value is not None:
             results_path = Path(results_value)

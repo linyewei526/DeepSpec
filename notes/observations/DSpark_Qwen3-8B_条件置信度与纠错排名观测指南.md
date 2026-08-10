@@ -6,7 +6,7 @@
 
 本实验不是任务正确率、`pass@1`、LLM judge、端到端速度或 TPS 实验。逐轮把 GPU 张量同步到 CPU 并计算完整词表排名会增加观测开销，所以本实验产物不能用来代表无观测 baseline 的耗时。
 
-## 2. 四项指标的精确定义
+## 2. 原四项指标与新增拒绝预测的精确定义
 
 令第 $k$ 个 draft token 的 confidence-head logit 为 $c_k$，本实验记录
 
@@ -41,7 +41,7 @@ DSpark 当前验证实现中的 correction token 是从归一化正残差分布 
 - `observations/conditional_confidence/__init__.py`：子实验包入口；
 - `observations/conditional_confidence/confidence_observation.py`：观测累加器、跨 rank 合并、CDF/rank 产物和隔离 evaluator；
 - `observations/conditional_confidence/run_confidence_observation.py`：时间戳目录校验、不可变 settings、自动端口租约、manifest 和多 GPU 启动；
-- `observations/conditional_confidence/summarize_confidence_observation.py`：只读汇总工具。
+- `observations/conditional_confidence/summarize_confidence_observation.py`：终端汇总工具，并可从新 schema 的精确计数幂等重建拒绝预测 Markdown。
 
 调用链为 `run_confidence_observation.py -> torch.multiprocessing.spawn -> ConditionalConfidenceEvaluator -> Qwen3DSparkEvaluator.generate_one_sample -> generate_decoding_sample -> build_dspark_proposal -> verify_draft_tokens -> _post_verify`。新 evaluator 先保留父类原有 confidence 校准记录，再执行本实验的只读观测。
 
@@ -76,7 +76,7 @@ set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN
 该命令按原指南第 8.2 节使用物理 GPU 2、3；可按实际显存情况修改可见卡列表。这里故意不设置固定 `MASTER_PORT`，由启动器自动分配。
 
 ```bash
-set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_conditional_confidence_all && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE -u MASTER_PORT CUDA_VISIBLE_DEVICES=0,1,2,3 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 /data/home/wly/.conda/envs/dspark/bin/python /data/home/wly/dLLM/DeepSpec/observations/conditional_confidence/run_confidence_observation.py all --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 2048 --temperature 1.0 --confidence-threshold 0.0 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 --master-addr 127.0.0.1 2>&1 | tee "$RUN_DIR/eval.log"
+set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_conditional_confidence_all && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE -u MASTER_PORT CUDA_VISIBLE_DEVICES=0,1,2,3 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 /data/home/wly/.conda/envs/dspark/bin/python /data/home/wly/dLLM/DeepSpec/observations/conditional_confidence/run_confidence_observation.py all --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 2048 --temperature 1.0 --confidence-threshold 0.0 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 --master-addr 127.0.0.1 --score-threshold-min 0.02 --score-threshold-max 1.00 --score-threshold-step 0.02 2>&1 | tee "$RUN_DIR/eval.log"
 ```
 
 ### 5.3 单数据集全量命令
@@ -123,6 +123,9 @@ set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN
 | `--master-addr` | `127.0.0.1` | 单机分布式 rendezvous 地址。 |
 | `--master-port` | 自动 | 不传时自动探测并租约；传入时严格检查端口范围、占用和同类实验租约。 |
 | `--max-samples` | 无 | 对每个所选数据集覆盖样本上限，但不会超过内置 cap；仅建议 smoke 使用。 |
+| `--score-threshold-min` | `0.02` | 直接拒绝预测的最小 confidence 阈值，包含端点。 |
+| `--score-threshold-max` | `1.00` | 直接拒绝预测的最大 confidence 阈值，包含端点。 |
+| `--score-threshold-step` | `0.02` | 阈值步长；区间必须可被它整除。默认共 50 个阈值。 |
 
 环境变量说明：`CUDA_VISIBLE_DEVICES` 决定进程数和逻辑卡映射；`env -u RANK -u WORLD_SIZE` 避免继承外部分布式作业的 rank；`env -u MASTER_PORT` 确保没有旧端口值干扰自动分配；`PYTHONPATH` 指向仓库；两个 offline 变量禁止 Hugging Face 联网解析。
 
@@ -137,6 +140,7 @@ YYYYMMDD_HHMMSS_conditional_confidence_all/
 ├── settings.json
 ├── experiment_manifest.json
 ├── dataset_results.jsonl
+├── conditional_confidence_rejection_thresholds.md
 ├── eval.log
 ├── progress/<dataset>/...
 ├── tensorboard/
@@ -146,6 +150,7 @@ YYYYMMDD_HHMMSS_conditional_confidence_all/
     ├── conditional_confidence_cdf.csv
     ├── signed_gap_cdf.csv
     ├── true_draft_rank.csv
+    ├── rejection_prediction_thresholds.csv
     ├── observation_plots.png
     └── rank_stats/rank_<rank>.json
 ```
@@ -187,4 +192,20 @@ tail -f /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/<时间戳目录>/eval.log
 /data/home/wly/.conda/envs/dspark/bin/python -c 'import json,sys; p=json.load(open(sys.argv[1])); print(p["status"], p["completed_dataset_count"], [(d["name"],d["status"]) for d in p["datasets"]])' /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/<时间戳目录>/experiment_manifest.json
 ```
 
-完整全量运行应满足：manifest 的 `status` 为 `completed`、`completed_dataset_count` 为 9、九个 dataset status 全为 `completed`，并且每个数据集都有上述四个聚合文件和所有可见 rank 的 `rank_stats`。不能仅凭进程退出或一张图判断实验完整。
+完整全量运行应满足：manifest 的 `status` 为 `completed`、`completed_dataset_count` 为 9、九个 dataset status 全为 `completed`，并且每个数据集都有上述聚合文件和所有可见 rank 的 `rank_stats`。不能仅凭进程退出或一张图判断实验完整。
+
+## 9. 每 0.02 confidence 阈值的直接拒绝预测表
+
+新 schema version 2 在原四项观测之外，对每个实际可判定 token 直接使用 $C_i=\operatorname{sigmoid}(\text{confidence\_logits}_i)$。默认阈值为 `0.02, 0.04, ..., 1.00`，在阈值 $t$ 下仅当 `C_i < t`（严格小于）才标记为“预测拒绝”。这一统计不需要前缀均值，所以 draft round 的位置 0 也纳入；实际通过位置记 accepted，首个失败并被 AR token 替换的位置记 rejected，首拒之后和 accepted EOS 后丢弃的位置不计入。
+
+根目录 `conditional_confidence_rejection_thresholds.md` 每完成一个数据集就写一张表，列为 `accepted_count`、`rejected_count`、`flagged_evaluable_count`、`accepted_share`、`rejected_share / precision`、`accepted_FPR`、`rejection_recall` 和 `flag_rate`，含义与置信度下降拒绝预测指南一致。文档末尾的表按“先在每个数据集内计算指标，再对数据集做算术平均”生成宏平均，不合并 token；count 均值可能是小数。比例出现 0/0 时不把它当 0，而是在该比例的宏平均中排除，并以 `(有定义数据集数/总数据集数)` 标明。
+
+推荐命令沿用第 5 节全部 baseline 超参；默认参数已经生成 0.02 网格。若要显式写出网格控制，只需在启动命令末尾 `2>&1` 之前增加 `--score-threshold-min 0.02 --score-threshold-max 1.00 --score-threshold-step 0.02`。三者修改后仍必须满足 `[min,max]` 位于 `[0,1]` 且能被 step 精确整除。
+
+对 schema version 2 的已完成目录幂等重建该 Markdown（单行命令）：
+
+```bash
+cd /data/home/wly/dLLM/DeepSpec && PYTHONPATH=/data/home/wly/dLLM/DeepSpec /data/home/wly/.conda/envs/dspark/bin/python /data/home/wly/dLLM/DeepSpec/observations/conditional_confidence/summarize_confidence_observation.py /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/<新时间戳目录> --refresh-rejection-markdown
+```
+
+旧 schema version 1 目录只保存 0.05 直方图，不能精确判断落在 0.02 边界两侧的 token，也没有逐 token 原始值，因此不能无损补出这张表；汇总器会明确报错，必须按本指南重新运行。该限制不会改写或作废旧实验已有的原四项产物。

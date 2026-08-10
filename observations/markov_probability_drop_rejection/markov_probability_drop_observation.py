@@ -29,6 +29,9 @@ from observations.markov_diagnostic_draft import (
     DiagnosticMarkovDraftProposal,
     DiagnosticMarkovProposalMixin,
 )
+from observations.rejection_prediction_summary import (
+    append_dataset_and_refresh_macro,
+)
 
 
 SCHEMA_VERSION = 2
@@ -670,17 +673,22 @@ def append_markdown_dataset_result(
     dataset_name: str,
     completed_at: str,
     summary: dict,
+    all_summaries: dict[str, dict],
 ) -> None:
     section = build_markdown_dataset_section(
         dataset_name=dataset_name,
         completed_at=completed_at,
         summary=summary,
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(section)
-        handle.flush()
-        os.fsync(handle.fileno())
+    append_dataset_and_refresh_macro(
+        path=path,
+        dataset_section=section,
+        summaries=all_summaries,
+        family_specs=(
+            ("token_x_drop_abs", "x", "absolute_drop_thresholds"),
+            ("token_y_drop_pct", "y", "percentage_drop_thresholds"),
+        ),
+    )
 
 
 def _write_threshold_csv(path: Path, rows: list[dict]) -> None:
@@ -996,8 +1004,12 @@ class MarkovProbabilityDropEvaluator(
                 dataset_name=dataset_name,
                 completed_at=completed_at,
                 summary=markdown_summary,
+                all_summaries=self.markov_probability_drop_summaries,
             )
-            print(f"Appended Markdown result to {markdown_path}", flush=True)
+            print(
+                f"Appended Markdown result and refreshed macro averages in {markdown_path}",
+                flush=True,
+            )
         results_value = getattr(self.args, "dataset_results_path", None)
         if results_value is not None:
             results_path = Path(results_value)

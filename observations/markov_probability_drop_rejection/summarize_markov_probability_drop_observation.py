@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only summary of a selected-token Markov probability-drop rejection-prediction run."""
+"""Summarize a Markov probability-drop run and optionally backfill macro averages."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import argparse
 import json
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
+from observations.rejection_prediction_summary import refresh_macro_only
 
 
 def parse_args() -> argparse.Namespace:
@@ -28,6 +30,14 @@ def parse_args() -> argparse.Namespace:
         "--threshold",
         default=None,
         help="Print only an exact decimal threshold, for example 0.100.",
+    )
+    parser.add_argument(
+        "--refresh-markdown-macro",
+        action="store_true",
+        help=(
+            "Idempotently rebuild the two all-dataset macro-average tables at the "
+            "end of markov_probability_drop_results.md from dataset_results.jsonl."
+        ),
     )
     return parser.parse_args()
 
@@ -95,6 +105,30 @@ def main() -> None:
         else {"status": "manifest_missing"}
     )
     result_rows = load_jsonl(results_path)
+    if cli.refresh_markdown_macro:
+        if manifest.get("status") == "running":
+            raise RuntimeError("Refusing to rewrite Markdown while the experiment is running")
+        summaries = {}
+        for result in result_rows:
+            dataset = str(result.get("dataset"))
+            summary = result.get("markov_probability_drop_observation_summary")
+            if not isinstance(summary, dict):
+                raise ValueError(
+                    f"Missing Markov probability-drop summary for dataset {dataset!r}"
+                )
+            summaries[dataset] = summary
+        if not summaries:
+            raise ValueError("No completed dataset summaries are available for macro averaging")
+        markdown_path = run_dir / "markov_probability_drop_results.md"
+        refresh_macro_only(
+            path=markdown_path,
+            summaries=summaries,
+            family_specs=(
+                ("token_x_drop_abs", "x", "absolute_drop_thresholds"),
+                ("token_y_drop_pct", "y", "percentage_drop_thresholds"),
+            ),
+        )
+        print(f"Refreshed all-dataset macro averages: {markdown_path}")
     if cli.dataset is not None:
         result_rows = [row for row in result_rows if row.get("dataset") == cli.dataset]
 

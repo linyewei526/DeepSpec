@@ -6,7 +6,7 @@
 
 本实验不是任务正确率、`pass@1`、LLM judge、端到端速度或 TPS 实验。逐轮把 GPU 张量同步到 CPU 并计算完整词表排名会增加观测开销，所以本实验产物不能用来代表无观测 baseline 的耗时。
 
-## 2. 四项指标的精确定义
+## 2. 原四项指标与新增拒绝预测的精确定义
 
 令第 $k$ 个 draft 位置经 Markov 头修正后的 logits 为 $\ell_k$。本实验定义温度无关的 diagnostic 分布为
 
@@ -54,7 +54,7 @@ DSpark 当前验证实现中的 correction token 是从 operational 分布构造
 - `observations/markov_draft_probability/__init__.py`：子实验包入口；
 - `observations/markov_draft_probability/markov_probability_observation.py`：观测累加器、跨 rank 合并、CDF/rank 产物和隔离 evaluator；
 - `observations/markov_draft_probability/run_markov_probability_observation.py`：时间戳目录校验、不可变 settings、自动端口租约、manifest 和多 GPU 启动；
-- `observations/markov_draft_probability/summarize_markov_probability_observation.py`：只读汇总工具。
+- `observations/markov_draft_probability/summarize_markov_probability_observation.py`：终端汇总工具，并可从新 schema 的精确计数幂等重建拒绝预测 Markdown。
 - `observations/markov_diagnostic_draft.py`：两组 Markov 观测共用的隔离 proposal mixin；同时保留 verifier 的 operational `draft_probs` 和只供观测的 corrected logits。
 
 调用链为 `run_markov_probability_observation.py -> torch.multiprocessing.spawn -> MarkovDraftProbabilityEvaluator -> generate_decoding_sample -> DiagnosticMarkovProposalMixin._propose -> build_diagnostic_markov_proposal -> verify_draft_tokens -> _post_verify`。新 evaluator 先保留父类原有 confidence 校准记录，再执行本实验的只读观测。
@@ -92,7 +92,7 @@ set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN
 该命令按原指南第 8.2 节使用物理 GPU 2、3；可按实际显存情况修改可见卡列表。这里故意不设置固定 `MASTER_PORT`，由启动器自动分配。
 
 ```bash
-set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_markov_draft_probability_all && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE -u MASTER_PORT CUDA_VISIBLE_DEVICES=0,1,2,3 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 /data/home/wly/.conda/envs/dspark/bin/python /data/home/wly/dLLM/DeepSpec/observations/markov_draft_probability/run_markov_probability_observation.py all --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 2048 --temperature 0.0 --confidence-threshold 0.0 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 --master-addr 127.0.0.1 2>&1 | tee "$RUN_DIR/eval.log"
+set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN_DIR=/data/home/wly/dLLM/DeepSpec-results/qwen3_8b/$(date +%Y%m%d_%H%M%S)_markov_draft_probability_all && mkdir "$RUN_DIR" && cd /data/home/wly/dLLM/DeepSpec && env -u RANK -u WORLD_SIZE -u MASTER_PORT CUDA_VISIBLE_DEVICES=0,1,2,3 PYTHONPATH=/data/home/wly/dLLM/DeepSpec HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 /data/home/wly/.conda/envs/dspark/bin/python /data/home/wly/dLLM/DeepSpec/observations/markov_draft_probability/run_markov_probability_observation.py all --run-dir "$RUN_DIR" --target /data1/linyewei/models/Qwen3-8B --draft /data1/linyewei/models/dspark_qwen3_8b_block7 --max-new-tokens 2048 --temperature 0.0 --confidence-threshold 0.0 --seed 980406 --step 0 --dist-backend gloo --dist-timeout-minutes 1440 --master-addr 127.0.0.1 --score-threshold-min 0.02 --score-threshold-max 1.00 --score-threshold-step 0.02 2>&1 | tee "$RUN_DIR/eval.log"
 ```
 
 ### 5.3 单数据集全量命令
@@ -139,6 +139,9 @@ set -o pipefail && mkdir -p /data/home/wly/dLLM/DeepSpec-results/qwen3_8b && RUN
 | `--master-addr` | `127.0.0.1` | 单机分布式 rendezvous 地址。 |
 | `--master-port` | 自动 | 不传时自动探测并租约；传入时严格检查端口范围、占用和同类实验租约。 |
 | `--max-samples` | 无 | 对每个所选数据集覆盖样本上限，但不会超过内置 cap；仅建议 smoke 使用。 |
+| `--score-threshold-min` | `0.02` | 直接拒绝预测的最小 diagnostic Markov 概率阈值，包含端点。 |
+| `--score-threshold-max` | `1.00` | 直接拒绝预测的最大概率阈值，包含端点。 |
+| `--score-threshold-step` | `0.02` | 阈值步长；区间必须可被它整除。默认共 50 个阈值。 |
 
 环境变量说明：`CUDA_VISIBLE_DEVICES` 决定进程数和逻辑卡映射；`env -u RANK -u WORLD_SIZE` 避免继承外部分布式作业的 rank；`env -u MASTER_PORT` 确保没有旧端口值干扰自动分配；`PYTHONPATH` 指向仓库；两个 offline 变量禁止 Hugging Face 联网解析。
 
@@ -153,6 +156,7 @@ YYYYMMDD_HHMMSS_markov_draft_probability_all/
 ├── settings.json
 ├── experiment_manifest.json
 ├── dataset_results.jsonl
+├── markov_draft_probability_rejection_thresholds.md
 ├── eval.log
 ├── progress/<dataset>/...
 ├── tensorboard/
@@ -162,6 +166,7 @@ YYYYMMDD_HHMMSS_markov_draft_probability_all/
     ├── markov_draft_probability_cdf.csv
     ├── signed_gap_cdf.csv
     ├── true_draft_rank.csv
+    ├── rejection_prediction_thresholds.csv
     ├── observation_plots.png
     └── rank_stats/rank_<rank>.json
 ```
@@ -177,7 +182,7 @@ YYYYMMDD_HHMMSS_markov_draft_probability_all/
 
 CDF CSV 中 `probability` 是当前 0.05 区间占全部已纳入该 gap 分布事件的比例，`cdf` 是截至该区间上沿的累计比例。对 relative gap，数值 `0.25` 表示失败位置错误 draft token 的 $P_k$ 比同轮通过位置均值低 25%。负 relative gap 不会出现，因为对应事件已由 `signed_absolute_gap < 0` 条件排除；排除规模应查看 `metrics.json`、`dataset_results.jsonl` 或终端汇总中的 `negative_gap_excluded_events`。
 
-当前温度无关 diagnostic 概率口径使用 schema version 3。目录 `20260807_173321_markov_draft_probability_all` 是 schema version 1；`20260807_180318_markov_draft_probability_all` 是 schema version 2，虽已采用非负 gap 过滤，但仍观测 temperature-dependent operational `draft_probs`。两者都不会被原地改写，也不能与 schema version 3 的概率、gap 或 rank 混合；新口径必须建立新的时间戳目录运行。schema version 3 settings 会同时写明 diagnostic/operational 分布分离和 `[0,1]` gap CDF 范围。
+当前温度无关 diagnostic 概率加精确直接拒绝预测口径使用 schema version 4。目录 `20260807_173321_markov_draft_probability_all` 是 schema version 1；`20260807_180318_markov_draft_probability_all` 是 schema version 2，虽已采用非负 gap 过滤，但仍观测 temperature-dependent operational `draft_probs`；schema version 3 已使用正确 diagnostic 概率，但尚未保存 0.02 阈值计数。旧目录都不会被原地改写；新口径必须建立新的时间戳目录运行。schema version 4 settings 会同时写明 diagnostic/operational 分布分离、`[0,1]` gap CDF 范围和完整阈值列表。
 
 ## 8. 运行监控与完整性检查
 
@@ -205,4 +210,20 @@ tail -f /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/<时间戳目录>/eval.log
 /data/home/wly/.conda/envs/dspark/bin/python -c 'import json,sys; p=json.load(open(sys.argv[1])); print(p["status"], p["completed_dataset_count"], [(d["name"],d["status"]) for d in p["datasets"]])' /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/<时间戳目录>/experiment_manifest.json
 ```
 
-完整全量运行应满足：manifest 的 `status` 为 `completed`、`completed_dataset_count` 为 9、九个 dataset status 全为 `completed`，并且每个数据集都有上述四个聚合文件和所有可见 rank 的 `rank_stats`。不能仅凭进程退出或一张图判断实验完整。
+完整全量运行应满足：manifest 的 `status` 为 `completed`、`completed_dataset_count` 为 9、九个 dataset status 全为 `completed`，并且每个数据集都有上述聚合文件和所有可见 rank 的 `rank_stats`。不能仅凭进程退出或一张图判断实验完整。
+
+## 9. 每 0.02 diagnostic Markov 概率阈值的直接拒绝预测表
+
+schema version 4 在原四项观测之外，对每个实际可判定 token 使用温度无关的 $P_i=\operatorname{softmax}(\text{markov\_corrected\_logits}_i)[z_i]$，其中 $z_i$ 是实际提交的 draft token。默认阈值为 `0.02, 0.04, ..., 1.00`，在阈值 $t$ 下仅当 `P_i < t`（严格小于）才标记为“预测拒绝”。位置 0 纳入；实际通过位置记 accepted，首个失败并被 AR token 替换的位置记 rejected，首拒之后和 accepted EOS 后丢弃的位置不计入。该 diagnostic 概率及阈值统计不做 temperature 缩放，也不替换 operational verifier 分布。
+
+根目录 `markov_draft_probability_rejection_thresholds.md` 每完成一个数据集就写一张表，字段与置信度下降拒绝预测表一致。文档末尾为跨数据集宏平均：每项指标先在各数据集独立计算，再对数据集做算术平均，不让 token 多的数据集主导；count 均值允许为小数。比例出现 0/0 时从该比例的平均中排除，并用 `(有定义数据集数/总数据集数)` 审计。
+
+推荐命令沿用第 5 节全部 baseline 超参；默认参数已经生成 0.02 网格。显式控制时，在启动命令末尾 `2>&1` 前增加 `--score-threshold-min 0.02 --score-threshold-max 1.00 --score-threshold-step 0.02`；区间必须位于 `[0,1]` 且可被 step 精确整除。
+
+对 schema version 4 的已完成目录幂等重建 Markdown（单行命令）：
+
+```bash
+cd /data/home/wly/dLLM/DeepSpec && PYTHONPATH=/data/home/wly/dLLM/DeepSpec /data/home/wly/.conda/envs/dspark/bin/python /data/home/wly/dLLM/DeepSpec/observations/markov_draft_probability/summarize_markov_probability_observation.py /data/home/wly/dLLM/DeepSpec-results/qwen3_8b/<新时间戳目录> --refresh-rejection-markdown
+```
+
+schema version 3 及更早目录只有宽度 0.05 的直方图，没有逐 token 原始值，无法精确还原 0.02 严格阈值表；汇总器会明确提示重跑。原有 probability、gap、rank 结果仍可继续使用，但不能冒充本新增统计。

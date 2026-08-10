@@ -18,6 +18,7 @@ import time
 import traceback
 from collections import OrderedDict
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -77,6 +78,9 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override each selected dataset cap; intended primarily for smoke tests.",
     )
+    parser.add_argument("--score-threshold-min", default="0.02")
+    parser.add_argument("--score-threshold-max", default="1.00")
+    parser.add_argument("--score-threshold-step", default="0.02")
     return parser.parse_args()
 
 
@@ -146,6 +150,33 @@ def build_tasks(dataset: str, max_samples: int | None) -> list[tuple[str, int]]:
     if max_samples is not None:
         selected = [(name, min(cap, max_samples)) for name, cap in selected]
     return selected
+
+
+def build_decimal_grid(
+    minimum_text: str,
+    maximum_text: str,
+    step_text: str,
+) -> tuple[Decimal, ...]:
+    try:
+        minimum = Decimal(minimum_text)
+        maximum = Decimal(maximum_text)
+        step = Decimal(step_text)
+    except InvalidOperation as exc:
+        raise ValueError("Invalid direct score threshold") from exc
+    if not minimum.is_finite() or not maximum.is_finite() or not step.is_finite():
+        raise ValueError("Direct score thresholds must be finite")
+    if minimum < 0 or maximum > 1 or maximum < minimum:
+        raise ValueError("Score threshold range must satisfy 0 <= min <= max <= 1")
+    if step <= 0:
+        raise ValueError("--score-threshold-step must be positive")
+    span_steps = (maximum - minimum) / step
+    integral_steps = span_steps.to_integral_value()
+    if span_steps != integral_steps:
+        raise ValueError(
+            f"Score threshold range [{minimum}, {maximum}] is not exactly "
+            f"divisible by step {step}"
+        )
+    return tuple(minimum + index * step for index in range(int(integral_steps) + 1))
 
 
 def _port_is_bindable(master_addr: str, port: int) -> bool:
@@ -225,6 +256,11 @@ def main() -> None:
         raise ValueError("--max-samples must be positive")
     if cli.dist_timeout_minutes <= 0:
         raise ValueError("--dist-timeout-minutes must be positive")
+    score_threshold_grid = build_decimal_grid(
+        cli.score_threshold_min,
+        cli.score_threshold_max,
+        cli.score_threshold_step,
+    )
 
     run_dir = cli.run_dir.expanduser().resolve()
     target = cli.target.expanduser().resolve()
@@ -284,13 +320,14 @@ def main() -> None:
     settings_path = run_dir / "settings.json"
     manifest_path = run_dir / "experiment_manifest.json"
     dataset_results_path = run_dir / "dataset_results.jsonl"
+    markdown_results_path = run_dir / "conditional_confidence_rejection_thresholds.md"
     progress_dir = run_dir / "progress"
     tensorboard_dir = run_dir / "tensorboard"
     baseline_artifact_dir = tensorboard_dir / "artifacts" / f"step_{cli.step}"
     observation_artifact_root = run_dir / "observations" / "conditional_confidence"
 
     settings = {
-        "schema_version": 1,
+        "schema_version": 2,
         "experiment": "dspark_qwen3_8b_conditional_confidence_and_true_draft_rank",
         "created_at": now_iso(),
         "run_dir": str(run_dir),
@@ -301,6 +338,18 @@ def main() -> None:
             "signed_relative_gap": "signed_gap / mean(s_k for accepted draft positions in the round); reported as ratio and percent.",
             "true_draft_rank": "1 + count(q_k[v] > q_k[correction_token]) over the complete Markov-corrected q_k; categories 1..10,other.",
             "cdf_bin_width": 0.05,
+            "direct_rejection_prediction": (
+                "For each configured threshold t, flag every evaluable position with "
+                "sigmoid(confidence_logits[k]) < t (strict). Position 0 is included; "
+                "positions after the first rejection or discarded after accepted EOS are excluded."
+            ),
+        },
+        "direct_rejection_prediction_thresholds": {
+            "minimum": str(score_threshold_grid[0]),
+            "maximum": str(score_threshold_grid[-1]),
+            "step": str(Decimal(cli.score_threshold_step)),
+            "count": len(score_threshold_grid),
+            "values": [str(value) for value in score_threshold_grid],
         },
         "scope": {
             "dataset_selection": cli.dataset,
@@ -372,6 +421,7 @@ def main() -> None:
             "manifest": str(manifest_path),
             "combined_log": str(run_dir / "eval.log"),
             "dataset_results_jsonl": str(dataset_results_path),
+            "rejection_prediction_markdown": str(markdown_results_path),
             "progress_dir": str(progress_dir),
             "tensorboard_dir": str(tensorboard_dir),
             "existing_confidence_artifact_dir": str(baseline_artifact_dir),
@@ -416,9 +466,25 @@ def main() -> None:
         observation_artifact_root.mkdir(parents=True, exist_ok=False)
         progress_dir.mkdir(parents=True, exist_ok=False)
         dataset_results_path.touch(exist_ok=False)
+        if str(REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(REPO_ROOT))
+        from observations.rejection_prediction_summary import (
+            write_markdown_header_exclusive,
+        )
+
+        write_markdown_header_exclusive(
+            path=markdown_results_path,
+            title="DSpark conditional-confidence direct rejection prediction",
+            score_definition=(
+                "`sigmoid(confidence_logits[k])`, the non-cumulative confidence-head "
+                "acceptance confidence"
+            ),
+            comparison="score < threshold (strict)",
+        )
         write_json_atomic(manifest_path, manifest)
         print(f"Experiment directory: {run_dir}", flush=True)
         print(f"Immutable settings: {settings_path}", flush=True)
+        print(f"Incremental rejection-prediction Markdown: {markdown_results_path}", flush=True)
         print(f"Reserved distributed endpoint: {cli.master_addr}:{master_port}", flush=True)
 
         worker_args = SimpleNamespace(
@@ -427,6 +493,7 @@ def main() -> None:
             max_new_tokens=cli.max_new_tokens,
             temperature=cli.temperature,
             confidence_threshold=cli.confidence_threshold,
+            score_thresholds=[str(value) for value in score_threshold_grid],
             tensorboard_dir=str(tensorboard_dir),
             observation_artifact_root=str(observation_artifact_root),
             step=cli.step,
@@ -434,6 +501,7 @@ def main() -> None:
             tasks=tasks,
             experiment_manifest_path=str(manifest_path),
             dataset_results_path=str(dataset_results_path),
+            markdown_results_path=str(markdown_results_path),
             progress_dir=str(progress_dir),
             settings_path=str(settings_path),
             dist_timeout_minutes=cli.dist_timeout_minutes,

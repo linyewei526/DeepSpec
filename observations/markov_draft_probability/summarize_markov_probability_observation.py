@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Read-only summary of a completed/in-progress selected-token Markov draft-probability observation run."""
+"""Summarize Markov observations and rebuild exact threshold Markdown when available."""
 
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
+
+from observations.rejection_prediction_summary import rebuild_direct_markdown
 
 
 def parse_args() -> argparse.Namespace:
@@ -16,6 +18,14 @@ def parse_args() -> argparse.Namespace:
         "--show-cdf",
         action="store_true",
         help="Also print all detailed width-0.05 CDF rows as JSON.",
+    )
+    parser.add_argument(
+        "--refresh-rejection-markdown",
+        action="store_true",
+        help=(
+            "Rebuild markov_draft_probability_rejection_thresholds.md from exact "
+            "schema-v4 dataset summaries; older runs require rerunning the experiment."
+        ),
     )
     return parser.parse_args()
 
@@ -54,6 +64,38 @@ def main() -> None:
         else {"status": "manifest_missing"}
     )
     rows = load_jsonl(results_path)
+    if cli.refresh_rejection_markdown:
+        if manifest.get("status") == "running":
+            raise RuntimeError("Refusing to rewrite Markdown while the experiment is running")
+        records = []
+        for row in rows:
+            dataset = str(row.get("dataset"))
+            observation_summary = row.get("markov_draft_probability_observation_summary")
+            prediction = (
+                observation_summary.get("direct_rejection_prediction")
+                if isinstance(observation_summary, dict)
+                else None
+            )
+            if not isinstance(prediction, dict) or not prediction.get("thresholds"):
+                raise ValueError(
+                    f"Dataset {dataset!r} has no exact width-0.02 threshold counts. "
+                    "The old width-0.05 histograms cannot reconstruct this table; rerun "
+                    "the Markov draft-probability experiment with schema v4."
+                )
+            records.append((dataset, str(row.get("completed_at", "unknown")), prediction))
+        markdown_path = run_dir / "markov_draft_probability_rejection_thresholds.md"
+        rebuild_direct_markdown(
+            path=markdown_path,
+            title="DSpark Markov draft-probability direct rejection prediction",
+            score_definition=(
+                "`softmax(markov_corrected_logits[k])[submitted_token]` without "
+                "temperature scaling"
+            ),
+            comparison="score < threshold (strict)",
+            dataset_records=records,
+            table_title="selected_markov_probability < threshold",
+        )
+        print(f"Rebuilt rejection-prediction Markdown: {markdown_path}")
     if cli.dataset is not None:
         rows = [row for row in rows if row.get("dataset") == cli.dataset]
 
